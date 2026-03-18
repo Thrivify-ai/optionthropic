@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── Design tokens ──────────────────────────────────────────────────────── */
+/* Dark (default) */
+:root {
+  --color-surface:        #0f172a;
+  --color-surface-card:   #1e293b;
+  --color-surface-border: #334155;
+  --color-text-base:      #f1f5f9;
+  --color-text-muted:     #94a3b8;
+  --color-text-subtle:    #64748b;
+}
+
+/* Light override */
+html.light {
+  --color-surface:        #f1f5f9;
+  --color-surface-card:   #ffffff;
+  --color-surface-border: #e2e8f0;
+  --color-text-base:      #0f172a;
+  --color-text-muted:     #475569;
+  --color-text-subtle:    #94a3b8;
+}
+
+/* ── Base layer ─────────────────────────────────────────────────────────── */
+@layer base {
+  body {
+    @apply bg-surface antialiased font-sans;
+    color: var(--color-text-base);
+  }
+  * { @apply border-surface-border; }
+}
+
+/* ── Component layer ────────────────────────────────────────────────────── */
+@layer components {
+  .card {
+    @apply bg-surface-card rounded-xl border border-surface-border p-5 shadow-md shadow-black/10;
+  }
+  .btn-primary {
+    @apply bg-brand-600 hover:bg-brand-700 text-white font-semibold py-2 px-4 rounded-lg
+           transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply py-2 px-3 rounded-lg transition-colors duration-200;
+    color: var(--color-text-muted);
+  }
+  .btn-ghost:hover {
+    background-color: rgba(0, 0, 0, 0.06);
+    color: var(--color-text-base);
+  }
+  .input {
+    @apply bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-sm
+           placeholder-slate-500 focus:outline-none focus:ring-2
+           focus:ring-brand-500 focus:border-transparent w-full;
+    color: var(--color-text-base);
+  }
+  .badge-green  { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-emerald-900/40 text-emerald-400; }
+  .badge-red    { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-900/40 text-red-400; }
+  .badge-yellow { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-900/40 text-yellow-400; }
+  .badge-blue   { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-900/40 text-blue-400; }
+}
+
+/* ── Light-mode text overrides ──────────────────────────────────────────── */
+/* Remap the dark-palette slate classes to legible values on a light bg     */
+html.light .text-slate-100 { color: #1e293b; }
+html.light .text-slate-200 { color: #334155; }
+html.light .text-slate-300 { color: #475569; }
+html.light .text-slate-400 { color: #64748b; }
+html.light .text-slate-500 { color: #94a3b8; }
+html.light .text-slate-600 { color: #cbd5e1; }
+
+/* Light-mode hover/fill overrides */
+html.light .hover\:text-slate-100:hover { color: #0f172a; }
+html.light .hover\:bg-white\/5:hover    { background-color: rgba(0,0,0,0.05); }
+html.light .bg-white\/5                 { background-color: rgba(0,0,0,0.03); }
+
+/* Light-mode surface tints */
+html.light .bg-slate-800\/40  { background-color: rgba(226,232,240,0.6); }
+html.light .bg-slate-700\/30  { background-color: rgba(226,232,240,0.4); }
+html.light .bg-slate-700\/60  { background-color: rgba(203,213,225,0.7); }

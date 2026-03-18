@@ -1,0 +1,42 @@
+version: 1.0
+runtime: python311
+build:
+  commands:
+    build:
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+run:
+  runtime-version: 3.11
+  command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
+  network:
+    port: 8080
+    env: APP_PORT
+  env:
+    - name: ENVIRONMENT
+      value: production
+    - name: LOG_LEVEL
+      value: INFO
+    - name: DATABASE_URL
+      value-from: /optionthropic/DATABASE_URL
+    - name: SECRET_KEY
+      value-from: /optionthropic/SECRET_KEY
+    - name: DATA_SOURCE
+      value: NSE
+    - name: USE_COGNITO
+      value: "true"
+    - name: COGNITO_USER_POOL_ID
+      value-from: /optionthropic/COGNITO_USER_POOL_ID
+    - name: COGNITO_CLIENT_ID
+      value-from: /optionthropic/COGNITO_CLIENT_ID
+    - name: AWS_REGION
+      value: ap-south-1
+    - name: SQS_QUEUE_URL
+      value-from: /optionthropic/SQS_QUEUE_URL
+    - name: OPENAI_API_KEY
+      value-from: /optionthropic/OPENAI_API_KEY
+    - name: ANTHROPIC_API_KEY
+      value-from: /optionthropic/ANTHROPIC_API_KEY
+    - name: AI_PROVIDER
+      value: openai
+    - name: NSE_API_URL
+      value: https://www.nseindia.com

@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Optionthropic infrastructure — RDS PostgreSQL, SQS, S3, Cognito, CloudWatch
+
+Parameters:
+  Env:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: RDS master password
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.small
+
+Resources:
+  # ─── VPC & Networking ───────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub optionthropic-vpc-${Env}
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Optionthropic RDS subnets
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS access from App Runner
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.0.0.0/16
+
+  # ─── RDS PostgreSQL ─────────────────────────────────────────────────────────
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub optionthropic-db-${Env}
+      DBName: optionthropic
+      Engine: postgres
+      EngineVersion: "15.6"
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 20
+      StorageType: gp3
+      MasterUsername: optionthropic
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      MultiAZ: !If [IsProd, true, false]
+      StorageEncrypted: true
+      DeletionProtection: !If [IsProd, true, false]
+      BackupRetentionPeriod: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Env
+
+  # ─── SQS Queue ──────────────────────────────────────────────────────────────
+  AlertsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub optionthropic-alerts-${Env}
+      MessageRetentionPeriod: 86400
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AlertsDLQ.Arn
+        maxReceiveCount: 3
+
+  AlertsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub optionthropic-alerts-dlq-${Env}
+      MessageRetentionPeriod: 604800
+
+  # ─── S3 Bucket (frontend static hosting) ───────────────────────────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub optionthropic-frontend-${Env}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${FrontendBucket}/*
+
+  # ─── CloudFront ─────────────────────────────────────────────────────────────
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          TargetOriginId: S3Origin
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_200
+        HttpVersion: http2
+
+  # ─── Cognito User Pool ──────────────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub optionthropic-users-${Env}
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      PasswordPolicy:
+        MinimumLength: 8
+        RequireLowercase: true
+        RequireNumbers: true
+        RequireUppercase: false
+        RequireSymbols: false
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: true
+      MfaConfiguration: "OFF"
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub optionthropic-app-${Env}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+
+  # ─── CloudWatch Log Groups ──────────────────────────────────────────────────
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /optionthropic/backend/${Env}
+      RetentionInDays: 30
+
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /optionthropic/collector/${Env}
+      RetentionInDays: 14
+
+  # ─── CloudWatch Alarms ──────────────────────────────────────────────────────
+  RDSCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub optionthropic-rds-cpu-${Env}
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+
+Conditions:
+  IsProd: !Equals [!Ref Env, production]
+
+Outputs:
+  RDSEndpoint:
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub optionthropic-rds-endpoint-${Env}
+
+  SQSQueueUrl:
+    Value: !Ref AlertsQueue
+    Export:
+      Name: !Sub optionthropic-sqs-url-${Env}
+
+  CloudFrontURL:
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+    Export:
+      Name: !Sub optionthropic-cdn-url-${Env}
+
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub optionthropic-cognito-pool-${Env}
+
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub optionthropic-cognito-client-${Env}

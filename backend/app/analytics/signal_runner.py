@@ -1,0 +1,387 @@
+"""
+Signal runner — computes and persists TradingSignal rows every collector cycle.
+
+Alignment strategy: use the SAME data sources as the Market Sentiment panel
+(PCR + gamma walls + max pain + options flow), mirror the frontend deriveAll()
+scoring in Python, then require price-momentum confirmation from a 5-minute
+snapshot before emitting a BUY signal.  This means Market Sentiment and Trade
+Signals will always agree on direction; the only difference is that Trade
+Signals also demands that price is actually MOVING in that direction.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.analytics.gamma_detection import compute_gamma_walls
+from app.analytics.max_pain_detection import compute_max_pain
+from app.analytics.options_analysis import compute_pcr
+from app.analytics.options_flow_detection import detect_options_flow
+from app.analytics.signal_engine import Bias, Signal, TradingSignal
+from app.config import settings
+from app.db.database import AsyncSessionLocal
+from app.logging_config import get_logger
+from app.models.chain_snapshot import ChainSnapshot
+from app.models.trading_signal import TradingSignalRow
+
+logger = get_logger(__name__)
+
+
+# ─── Sentiment scoring (mirrors frontend deriveAll) ───────────────────────────
+
+async def _compute_sentiment(session: AsyncSession, symbol: str) -> dict:
+    """
+    Compute the same 4-signal bias score as MarketBiasPanel.deriveAll().
+    Returns a dict with: score, n_signals, bias, conf_label, pcr_oi,
+    spot, call_wall, put_wall, max_pain, flow_summary.
+    """
+    try:
+        pcr_data  = await compute_pcr(session, symbol)
+    except Exception:
+        pcr_data  = {}
+    try:
+        gamma_data = await compute_gamma_walls(session, symbol)
+    except Exception:
+        gamma_data = {}
+    try:
+        mp_data    = await compute_max_pain(session, symbol)
+    except Exception:
+        mp_data    = {}
+    try:
+        flow_data  = await detect_options_flow(session, symbol, top_n=20)
+    except Exception:
+        flow_data  = {}
+
+    pcr_oi    = float(pcr_data.get("pcr_oi")             or 0)
+    spot      = float(gamma_data.get("underlying_price")  or 0)
+    call_wall = float(gamma_data.get("call_wall")          or 0)
+    put_wall  = float(gamma_data.get("put_wall")           or 0)
+    max_pain  = float(mp_data.get("max_pain_strike")       or 0)
+    summary   = flow_data.get("summary") or {}
+    flows     = flow_data.get("flows")   or []
+    dom       = summary.get("dominant_flow") or ""
+    call_prem = float(summary.get("total_call_premium") or 0)
+    put_prem  = float(summary.get("total_put_premium")  or 0)
+
+    score     = 0
+    n_signals = 0
+
+    # ── PCR (same thresholds as MarketBiasPanel: 1.2 / 1.0 / 0.8) ────────────
+    if pcr_oi > 0:
+        n_signals += 1
+        if   pcr_oi > 1.2: score += 2
+        elif pcr_oi > 1.0: score += 1
+        elif pcr_oi < 0.8: score -= 2
+        else:               score -= 1
+
+    # ── Gamma wall position ────────────────────────────────────────────────────
+    rng = call_wall - put_wall
+    if spot and call_wall and put_wall and rng > 0:
+        n_signals += 1
+        pos = (spot - put_wall) / rng
+        if   pos > 0.65: score += 1
+        elif pos < 0.35: score -= 1
+
+    # ── Max pain vs spot ──────────────────────────────────────────────────────
+    if spot and max_pain:
+        n_signals += 1
+        if   max_pain > spot * 1.005: score += 1
+        elif max_pain < spot * 0.995: score -= 1
+
+    # ── Options flow dominance ────────────────────────────────────────────────
+    if flows:
+        n_signals += 1
+        if   dom == "put_writing"  or put_prem  > call_prem * 1.5: score += 1
+        elif dom == "call_writing" or call_prem > put_prem  * 1.5: score -= 1
+        elif dom == "put_buying":                                    score -= 1
+        elif dom == "call_buying":                                   score += 1
+
+    # ── Bias label (same as MarketBiasPanel) ──────────────────────────────────
+    if   score >= 2:  bias = Bias.BULLISH
+    elif score <= -2: bias = Bias.BEARISH
+    else:             bias = Bias.NEUTRAL
+
+    # ── Confidence % ─────────────────────────────────────────────────────────
+    max_s = n_signals * 2
+    conf_pct = int(min(95, abs(score) / max_s * 100)) if max_s > 0 else 0
+
+    conf_label = (
+        "HIGH"   if conf_pct >= 65 else
+        "MEDIUM" if conf_pct >= 40 else
+        "LOW"
+    )
+
+    return {
+        "score":      score,
+        "n_signals":  n_signals,
+        "bias":       bias,
+        "conf_pct":   conf_pct,
+        "conf_label": conf_label,
+        "pcr_oi":     pcr_oi,
+        "spot":       spot,
+        "call_wall":  call_wall,
+        "put_wall":   put_wall,
+        "max_pain":   max_pain,
+        "flow_dom":   dom,
+        "summary":    summary,
+    }
+
+
+# ─── Price momentum snapshot ──────────────────────────────────────────────────
+
+async def _price_snapshot(session: AsyncSession, symbol: str, minutes: int) -> dict | None:
+    """
+    Return (current_price, prev_price, support, resistance) for the last
+    `minutes` window.  Used only for momentum / rangebound checks.
+    """
+    now   = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=minutes)
+
+    latest_ts = (
+        await session.execute(
+            select(func.max(ChainSnapshot.timestamp))
+            .where(ChainSnapshot.symbol == symbol)
+        )
+    ).scalar()
+    if not latest_ts:
+        return None
+
+    start_ts = (
+        await session.execute(
+            select(func.max(ChainSnapshot.timestamp))
+            .where(ChainSnapshot.symbol == symbol,
+                   ChainSnapshot.timestamp <= start)
+        )
+    ).scalar() or latest_ts
+
+    latest_row = (
+        await session.execute(
+            select(ChainSnapshot)
+            .where(ChainSnapshot.symbol == symbol,
+                   ChainSnapshot.timestamp == latest_ts)
+            .limit(1)
+        )
+    ).scalars().first()
+    if not latest_row:
+        return None
+
+    start_row = (
+        await session.execute(
+            select(ChainSnapshot)
+            .where(ChainSnapshot.symbol == symbol,
+                   ChainSnapshot.timestamp == start_ts)
+            .limit(1)
+        )
+    ).scalars().first() or latest_row
+
+    current_price = float(latest_row.underlying_price or 0)
+    prev_price    = float(start_row.underlying_price  or 0)
+    band          = current_price * 0.03
+
+    all_latest = (
+        await session.execute(
+            select(ChainSnapshot)
+            .where(ChainSnapshot.symbol == symbol,
+                   ChainSnapshot.timestamp == latest_ts)
+        )
+    ).scalars().all()
+
+    support = resistance = None
+    if all_latest and current_price > 0 and band > 0:
+        put_rows  = [r for r in all_latest
+                     if float(r.strike) <= current_price
+                     and abs(float(r.strike) - current_price) <= band]
+        call_rows = [r for r in all_latest
+                     if float(r.strike) >= current_price
+                     and abs(float(r.strike) - current_price) <= band]
+        if put_rows:
+            support    = float(max(put_rows,  key=lambda r: r.put_oi).strike)
+        if call_rows:
+            resistance = float(max(call_rows, key=lambda r: r.call_oi).strike)
+
+    return {
+        "current_price": current_price,
+        "prev_price":    prev_price,
+        "support":       support,
+        "resistance":    resistance,
+        "pct_move":      abs(current_price - prev_price) / prev_price if prev_price > 0 else 0,
+        "price_up":      current_price > prev_price,
+        "price_down":    current_price < prev_price,
+    }
+
+
+# ─── Aligned signal generation ────────────────────────────────────────────────
+
+def _make_signal(
+    symbol: str,
+    sentiment: dict,
+    snap5: dict | None,
+    snap30: dict | None,
+    snap60: dict | None,
+) -> TradingSignal:
+    """
+    Produce a TradingSignal aligned with Market Sentiment.
+
+    Rules:
+    1. Rangebound (< 0.15% move in 30 min): always WAIT.
+    2. sentiment BULLISH + 5m price up + conf >= 60%: Buy CE.
+    3. sentiment BEARISH + 5m price down + conf >= 60%: Buy PE.
+    4. Sentiment BULLISH/BEARISH but price not moving yet: WAIT (explaining why).
+    5. Neutral sentiment: WAIT.
+    """
+    bias     = sentiment["bias"]
+    conf_pct = sentiment["conf_pct"]
+    score    = sentiment["score"]
+    n_sig    = sentiment["n_signals"]
+    pcr_oi   = sentiment["pcr_oi"]
+    dom      = sentiment["flow_dom"]
+
+    support    = (snap60 or snap30 or snap5 or {}).get("support")
+    resistance = (snap60 or snap30 or snap5 or {}).get("resistance")
+
+    # Derive display biases per timeframe from price direction vs sentiment
+    def _tf_bias(snap: dict | None) -> Bias:
+        if snap is None:
+            return Bias.NEUTRAL
+        if bias == Bias.BULLISH and snap["price_up"]:
+            return Bias.BULLISH
+        if bias == Bias.BEARISH and snap["price_down"]:
+            return Bias.BEARISH
+        return Bias.NEUTRAL
+
+    b5  = _tf_bias(snap5)
+    b30 = _tf_bias(snap30)
+    b60 = bias  # 60 m aligns with overall sentiment direction
+
+    def _wait(reason: str) -> TradingSignal:
+        return TradingSignal(
+            symbol=symbol, signal=Signal.WAIT, confidence=conf_pct,
+            support=support, resistance=resistance,
+            bias_5m=b5, bias_30m=b30, bias_60m=b60,
+            reason=reason,
+        )
+
+    # ── 1. Rangebound guard ──────────────────────────────────────────────────
+    if snap30 and snap30["pct_move"] < 0.0015:
+        return _wait(
+            f"Market rangebound (< 0.15% move in 30 min). "
+            f"Sentiment {bias.value} but no directional price move. Wait."
+        )
+
+    # ── 2. Stable time move: 5m/30m/60m all same direction ────────────────────
+    stable_up = (
+        snap5 and snap5["price_up"]
+        and (not snap30 or snap30["price_up"])
+        and (not snap60 or snap60["price_up"])
+    )
+    stable_down = (
+        snap5 and snap5["price_down"]
+        and (not snap30 or snap30["price_down"])
+        and (not snap60 or snap60["price_down"])
+    )
+
+    pcr_str  = f"PCR {pcr_oi:.2f}"
+    dom_str  = dom.replace("_", " ").title() if dom else "mixed flow"
+    score_str = f"score {score}/{n_sig * 2 if n_sig else '?'}"
+
+    # ── 3. Buy CE (stable uptrend) ────────────────────────────────────────────
+    if bias == Bias.BULLISH and stable_up and conf_pct >= 60:
+        reason = (
+            f"Stable uptrend ({score_str}): {pcr_str}, {dom_str}. "
+            f"5m/30m/60m price aligned upward."
+        )
+        return TradingSignal(
+            symbol=symbol, signal=Signal.BUY_CE,
+            confidence=min(conf_pct + 10, 95),
+            support=support, resistance=resistance,
+            bias_5m=Bias.BULLISH, bias_30m=b30, bias_60m=Bias.BULLISH,
+            reason=reason,
+        )
+
+    # ── 4. Buy PE (stable downtrend) ──────────────────────────────────────────
+    if bias == Bias.BEARISH and stable_down and conf_pct >= 60:
+        reason = (
+            f"Stable downtrend ({score_str}): {pcr_str}, {dom_str}. "
+            f"5m/30m/60m price aligned downward."
+        )
+        return TradingSignal(
+            symbol=symbol, signal=Signal.BUY_PE,
+            confidence=min(conf_pct + 10, 95),
+            support=support, resistance=resistance,
+            bias_5m=Bias.BEARISH, bias_30m=b30, bias_60m=Bias.BEARISH,
+            reason=reason,
+        )
+
+    # ── 5. Wait with informative reason ──────────────────────────────────────
+    if bias == Bias.BULLISH:
+        reason = (
+            f"Sentiment Bullish ({score_str}, {pcr_str}) "
+            f"but need 5m/30m/60m aligned upward for stable move. Wait for momentum."
+        )
+    elif bias == Bias.BEARISH:
+        reason = (
+            f"Sentiment Bearish ({score_str}, {pcr_str}) "
+            f"but need 5m/30m/60m aligned downward for stable move. Wait for momentum."
+        )
+    else:
+        reason = (
+            f"Mixed signals ({score_str}, {pcr_str}, {dom_str}). "
+            f"No clear directional consensus — wait."
+        )
+
+    return _wait(reason)
+
+
+# ─── Main cycle ───────────────────────────────────────────────────────────────
+
+async def run_signal_engine_cycle() -> None:
+    """
+    Run once per collector cycle:
+    1. Compute Market-Sentiment-aligned score for each symbol.
+    2. Build price momentum snapshots.
+    3. Generate and persist a TradingSignal.
+    """
+    async with AsyncSessionLocal() as session:
+        for symbol in settings.supported_symbols:
+            try:
+                # Same analytics stack as Market Sentiment
+                sentiment = await _compute_sentiment(session, symbol)
+
+                # Price momentum windows
+                snap5  = await _price_snapshot(session, symbol, 5)
+                snap30 = await _price_snapshot(session, symbol, 30)
+                snap60 = await _price_snapshot(session, symbol, 60)
+
+                ts = _make_signal(symbol, sentiment, snap5, snap30, snap60)
+
+                row = TradingSignalRow(
+                    symbol=symbol,
+                    signal=ts.signal.value,
+                    confidence=ts.confidence,
+                    support=ts.support,
+                    resistance=ts.resistance,
+                    bias_5m=ts.bias_5m.value,
+                    bias_30m=ts.bias_30m.value,
+                    bias_60m=ts.bias_60m.value,
+                    reason=ts.reason,
+                )
+                session.add(row)
+
+                logger.info(
+                    "signal_generated",
+                    symbol=symbol,
+                    signal=ts.signal.value,
+                    confidence=ts.confidence,
+                    sentiment=sentiment["bias"].value,
+                    pcr_oi=round(sentiment["pcr_oi"], 3),
+                    score=f"{sentiment['score']}/{sentiment['n_signals'] * 2}",
+                )
+
+            except Exception as exc:
+                logger.warning("signal_engine_cycle_failed",
+                               symbol=symbol, error=str(exc))
+
+        await session.commit()

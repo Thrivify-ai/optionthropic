@@ -1,0 +1,10 @@
+# Open psql interactive shell
+docker exec -it optionthropic_postgres psql -U optionthropic -d optionthropic
+# Inside psql — useful queries:
+\dt                                               -- list all tables
+SELECT COUNT(*) FROM options_snapshots;           -- row count
+SELECT * FROM options_snapshots ORDER BY timestamp DESC LIMIT 5;  -- latest snapshots
+SELECT * FROM chain_snapshots WHERE symbol='NIFTY' ORDER BY timestamp DESC LIMIT 5;
+SELECT * FROM gamma_levels ORDER BY timestamp DESC LIMIT 10;
+SELECT * FROM max_pain_levels ORDER BY timestamp DESC LIMIT 5;
+\q                                                -- quit psql
