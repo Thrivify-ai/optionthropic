@@ -10,4 +10,8 @@ export const proApi = {
     api.get("/api/pro/signals").then((r) => r.data).catch(() => ({})),
   commodities: () =>
     api.get("/api/pro/commodities").then((r) => r.data).catch(() => ({})),
+  buySignalHistory: (symbol) =>
+    api.get("/api/buy-signal-history", { params: symbol ? { symbol } : {} }).then((r) => r.data?.history ?? []).catch(() => []),
+  saveBuySignal: (body) =>
+    api.post("/api/buy-signal-history", body).then((r) => r.data).catch(() => null),
 };

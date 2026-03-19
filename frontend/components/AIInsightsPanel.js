@@ -14,14 +14,24 @@ const SYMBOL_META = {
   SENSEX:    { label: "BSE SENSEX",  color: "text-orange-400",  border: "border-orange-500/30",  bg: "from-orange-900/20"    },
 };
 
-function InsightCard({ symbol, onDataLoaded, refreshTick }) {
+function InsightCard({ symbol, onDataLoaded, refreshTick, deferMs = 0 }) {
   const [data, setData]    = useState(null);
   const [loading, setLoad] = useState(true);
   const [error, setError]  = useState(null);
+  const [ready, setReady]  = useState(!deferMs);
   const meta = SYMBOL_META[symbol] || SYMBOL_META.NIFTY;
 
   useEffect(() => {
-    if (!symbol) return;
+    if (deferMs > 0) {
+      const t = setTimeout(() => setReady(true), deferMs);
+      return () => clearTimeout(t);
+    } else {
+      setReady(true);
+    }
+  }, [deferMs]);
+
+  useEffect(() => {
+    if (!symbol || !ready) return;
     const firstLoad = !data;
     if (firstLoad) setLoad(true);
     setError(null);
@@ -30,7 +40,7 @@ function InsightCard({ symbol, onDataLoaded, refreshTick }) {
       .then((d) => { setData(d); onDataLoaded?.(); })
       .catch(() => setError("AI insight unavailable"))
       .finally(() => { if (firstLoad) setLoad(false); });
-  }, [symbol, onDataLoaded, refreshTick]);
+  }, [symbol, onDataLoaded, refreshTick, ready]);
 
   return (
     <div className={clsx(
@@ -79,7 +89,15 @@ function InsightCard({ symbol, onDataLoaded, refreshTick }) {
 export default function AIInsightsPanel({ onDataLoaded, refreshTick }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-      {SYMBOLS.map(s => <InsightCard key={s} symbol={s} onDataLoaded={onDataLoaded} refreshTick={refreshTick} />)}
+      {SYMBOLS.map((s, i) => (
+        <InsightCard
+          key={s}
+          symbol={s}
+          onDataLoaded={onDataLoaded}
+          refreshTick={refreshTick}
+          deferMs={i * 500}
+        />
+      ))}
     </div>
   );
 }

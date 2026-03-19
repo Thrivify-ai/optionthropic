@@ -16,29 +16,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.chain_snapshot import ChainSnapshot
 from app.services.tick_stream import get_latest_ticks, get_price_10s_ago
 
-# 10s momentum thresholds (points)
-_THRESH = {"NIFTY": 15, "BANKNIFTY": 35, "SENSEX": 45}
+# 10s momentum thresholds (points) — relaxed to catch more moves
+_THRESH = {"NIFTY": 10, "BANKNIFTY": 22, "SENSEX": 28}
 
 
 async def run_pro_quick_signal(session: AsyncSession, symbol: str) -> dict[str, Any]:
     """
-    Pro quick signal using 10-second tick momentum.
-    Rules: BUY CE (bullish + breakout + call OI dec + vol spike), BUY PE (bearish + breakdown + put OI dec + vol spike).
+    Pro quick signal: 10s tick momentum when available, else chain_snapshot 1m fallback.
     """
     symbol = symbol.upper()
     ticks = get_latest_ticks()
     tick_data = ticks.get(symbol)
-    price_now = tick_data["price"] if tick_data else None
-    price_10s = get_price_10s_ago(symbol)
-
+    price_now = tick_data.get("price") if tick_data else None
     if price_now is None:
-        return _wait_out(symbol, "No tick data")
+        price_now = await _latest_price_from_snap(session, symbol)
+    if price_now is None:
+        return _wait_out(symbol, "No price data")
 
+    price_10s = get_price_10s_ago(symbol)
     momentum_10s = round(price_now - price_10s, 2) if price_10s else None
-    bull = momentum_10s is not None and momentum_10s >= _THRESH.get(symbol, 20)
-    bear = momentum_10s is not None and momentum_10s <= -_THRESH.get(symbol, 20)
 
-    # Fetch OI/volume from latest chain snapshot
+    # Fallback: when no 10s tick history, use chain snapshot delta (~45–90s)
+    if momentum_10s is None:
+        momentum_10s = await _snap_momentum(session, symbol, price_now)
+        momentum_10s = round(momentum_10s, 2) if momentum_10s is not None else None
+
+    thresh = _THRESH.get(symbol, 20)
+    bull = momentum_10s is not None and momentum_10s >= thresh
+    bear = momentum_10s is not None and momentum_10s <= -thresh
+
     support, resistance, call_oi_delta, put_oi_delta, vol_spike = await _snap_context(
         session, symbol, price_now
     )
@@ -84,9 +90,38 @@ async def run_pro_quick_signal(session: AsyncSession, symbol: str) -> dict[str, 
 
     return _wait_out(
         symbol,
-        f"Momentum {momentum_10s or 0:+.0f} below ±{_THRESH.get(symbol, 20)} pts (10s)",
+        f"Momentum {momentum_10s or 0:+.0f} below ±{thresh} pts",
         momentum_10s=momentum_10s,
     )
+
+
+async def _latest_price_from_snap(session: AsyncSession, symbol: str) -> float | None:
+    """Fallback price from latest chain snapshot when ticks unavailable."""
+    row = (
+        await session.execute(
+            select(ChainSnapshot.underlying_price)
+            .where(ChainSnapshot.symbol == symbol)
+            .order_by(desc(ChainSnapshot.timestamp))
+            .limit(1)
+        )
+    ).scalars().first()
+    return float(row) if row is not None else None
+
+
+async def _snap_momentum(session: AsyncSession, symbol: str, price_now: float) -> float | None:
+    """Momentum from chain snapshot: price_now - prev timestamp. Used when tick 10s unavailable."""
+    rows = (
+        await session.execute(
+            select(ChainSnapshot.underlying_price, ChainSnapshot.timestamp)
+            .where(ChainSnapshot.symbol == symbol)
+            .order_by(desc(ChainSnapshot.timestamp))
+            .limit(3)
+        )
+    ).all()
+    if len(rows) < 2:
+        return None
+    prev_price = rows[1][0]
+    return float(price_now) - float(prev_price) if prev_price else None
 
 
 async def _snap_context(session: AsyncSession, symbol: str, spot: float):

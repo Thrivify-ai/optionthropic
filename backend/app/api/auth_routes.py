@@ -49,6 +49,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+# Admin email — always gets admin + pro
+ADMIN_EMAIL = "shivraj@thrivify.ai"
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -56,6 +60,7 @@ class TokenResponse(BaseModel):
     user_id: str
     email: str
     plan: str
+    is_admin: bool = False
 
 
 class UserResponse(BaseModel):
@@ -164,6 +169,20 @@ async def require_admin(
     return current_user
 
 
+async def require_pro(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    """Pro Signals access: PRO, ENTERPRISE, or admin."""
+    if current_user.is_admin:
+        return current_user
+    if current_user.plan in (UserPlan.PRO, UserPlan.ENTERPRISE):
+        return current_user
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Pro plan required. Upgrade to access Pro Signals.",
+    )
+
+
 # ─── Routes ────────────────────────────────────────────────────────────────────
 
 @router.post("/signup", response_model=TokenResponse, status_code=201)
@@ -185,10 +204,14 @@ async def signup(
             logger.error("Cognito signup failed", error=str(exc))
             raise HTTPException(status_code=502, detail="Identity provider error")
 
+    is_admin = body.email.lower() == ADMIN_EMAIL.lower()
+    plan = UserPlan.PRO if is_admin else UserPlan.FREE
+
     user = User(
         email=body.email,
         password_hash=_hash_password(body.password) if not settings.use_cognito else None,
-        plan=UserPlan.FREE,
+        plan=plan,
+        is_admin=is_admin,
         cognito_sub=cognito_sub,
     )
     session.add(user)
@@ -204,13 +227,17 @@ async def signup(
     )
     await session.commit()
 
-    token = _create_access_token(user.id, {"email": user.email, "plan": user.plan.value})
+    token = _create_access_token(
+        user.id,
+        {"email": user.email, "plan": user.plan.value, "is_admin": user.is_admin},
+    )
     return TokenResponse(
         access_token=token,
         expires_in=settings.access_token_expire_minutes * 60,
         user_id=user.id,
         email=user.email,
         plan=user.plan.value,
+        is_admin=user.is_admin,
     )
 
 
@@ -245,13 +272,17 @@ async def login(
     )
     await session.commit()
 
-    token = _create_access_token(user.id, {"email": user.email, "plan": user.plan.value})
+    token = _create_access_token(
+        user.id,
+        {"email": user.email, "plan": user.plan.value, "is_admin": user.is_admin},
+    )
     return TokenResponse(
         access_token=token,
         expires_in=settings.access_token_expire_minutes * 60,
         user_id=user.id,
         email=user.email,
         plan=user.plan.value,
+        is_admin=user.is_admin,
     )
 
 

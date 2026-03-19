@@ -1,14 +1,51 @@
 /**
  * Pro Signals — live ticks, quick signals, swing signals, explanations.
+ * Free users see upgrade prompt; Pro/Enterprise/admin see full content.
  */
+import { useEffect, useState } from "react";
 import Layout from "../components/Layout";
 import ProTicker from "../components/ProTicker";
 import QuickSignalsPro from "../components/QuickSignalsPro";
 import SwingSignalsPro from "../components/SwingSignalsPro";
 import ExplanationCard from "../components/ExplanationCard";
 import ProCommodities from "../components/ProCommodities";
+import UpgradePrompt from "../components/UpgradePrompt";
+import { authApi } from "../lib/api";
+
+function hasProAccess(user) {
+  if (!user) return false;
+  if (user.is_admin) return true;
+  return user.plan === "pro" || user.plan === "enterprise";
+}
 
 export default function ProSignals() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    authApi
+      .me()
+      .then(setUser)
+      .catch(() => setUser(null))
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) {
+    return (
+      <Layout>
+        <div className="card animate-pulse h-64" />
+      </Layout>
+    );
+  }
+
+  if (!hasProAccess(user)) {
+    return (
+      <Layout>
+        <UpgradePrompt />
+      </Layout>
+    );
+  }
+
   return (
     <Layout>
       <div className="space-y-6">

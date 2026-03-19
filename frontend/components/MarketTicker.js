@@ -36,8 +36,11 @@ function fmtAbs(val) {
     maximumFractionDigits: 2,
   });
 }
+function round(n, d) {
+  return Math.round(n * Math.pow(10, d)) / Math.pow(10, d);
+}
 
-function PriceItem({ symbol, data }) {
+function PriceItem({ symbol, data, live }) {
   const price     = data?.price;
   const change    = data?.change;
   const changePct = data?.change_pct;
@@ -50,9 +53,14 @@ function PriceItem({ symbol, data }) {
       <span className="text-[11px] font-semibold uppercase tracking-widest text-slate-500">
         {symbol}
       </span>
+      {live && (
+        <span className="text-[8px] font-bold text-emerald-500 uppercase tracking-wider animate-pulse">
+          Live
+        </span>
+      )}
       <span
         className={clsx(
-          "text-sm font-mono font-semibold tabular-nums",
+          "text-sm font-mono font-semibold tabular-nums transition-colors duration-200",
           up ? "text-emerald-400" : down ? "text-red-400" : "text-slate-200"
         )}
       >
@@ -77,24 +85,57 @@ function PriceItem({ symbol, data }) {
   );
 }
 
-export default function MarketTicker({ refreshTick }) {
+export default function MarketTicker({ refreshTick, onTickerUpdate }) {
   const [prices, setPrices] = useState({});
+  const [liveMode, setLiveMode] = useState(false);  // true when tick-by-tick data flows
   const [open, setOpen]     = useState(isMarketOpen());
-  const wasOpenRef          = useRef(isMarketOpen()); // track previous state
+  const wasOpenRef          = useRef(isMarketOpen());
   const priceTimerRef       = useRef(null);
 
-  // ── Price fetching ──────────────────────────────────────────────────────────
   const loadPrices = () => {
     analyticsApi.marketPrices()
       .then((data) => {
-        if (data && Object.keys(data).length > 0) setPrices(data);
+        if (data && Object.keys(data).length > 0) {
+          setPrices(data);
+          setLiveMode(false);
+          onTickerUpdate?.(new Date());
+        }
       })
       .catch(() => {});
   };
 
+  const pollPrices = () => {
+    analyticsApi.liveTicks()
+      .then((data) => {
+        if (data && Object.keys(data).length > 0) {
+          const withPct = {};
+          for (const [sym, d] of Object.entries(data)) {
+            const price = d.price;
+            const change = d.change;
+            const prevClose = price != null && change != null ? price - change : null;
+            withPct[sym] = {
+              ...d,
+              change_pct: prevClose && change != null ? round((change / prevClose) * 100, 2) : null,
+            };
+          }
+          setPrices(withPct);
+          setLiveMode(true);
+          onTickerUpdate?.(new Date());
+        } else {
+          loadPrices();
+          setLiveMode(false);
+        }
+      })
+      .catch(() => {
+        loadPrices();
+        setLiveMode(false);
+      });
+  };
+
   const startPricePolling = () => {
-    if (priceTimerRef.current) return;           // already running
-    priceTimerRef.current = setInterval(loadPrices, 60_000);
+    if (priceTimerRef.current) return;
+    pollPrices();
+    priceTimerRef.current = setInterval(pollPrices, 5_000);
   };
 
   const stopPricePolling = () => {
@@ -102,26 +143,23 @@ export default function MarketTicker({ refreshTick }) {
       clearInterval(priceTimerRef.current);
       priceTimerRef.current = null;
     }
+    setLiveMode(false);
+    loadPrices();
   };
 
-  // Always load on mount regardless of market status
   useEffect(() => {
     loadPrices();
     if (isMarketOpen()) startPricePolling();
 
-    // Check market status every 15 s — flips "Live" / "Closed" label quickly,
-    // and triggers a fresh price load the moment market opens.
     const statusTimer = setInterval(() => {
       const mo = isMarketOpen();
       setOpen(mo);
-
       if (mo && !wasOpenRef.current) {
-        // Transition: closed → open — kick off live data immediately
-        loadPrices();
+        pollPrices();
         startPricePolling();
       } else if (!mo && wasOpenRef.current) {
-        // Transition: open → closed — stop polling
         stopPricePolling();
+        loadPrices();
       }
       wasOpenRef.current = mo;
     }, 15_000);
@@ -132,9 +170,8 @@ export default function MarketTicker({ refreshTick }) {
     };
   }, []);
 
-  // Also re-fetch on movement tick from parent
   useEffect(() => {
-    if (refreshTick > 0 && isMarketOpen()) loadPrices();
+    if (refreshTick > 0 && isMarketOpen()) pollPrices();
   }, [refreshTick]);
 
   return (
@@ -154,10 +191,10 @@ export default function MarketTicker({ refreshTick }) {
           </span>
         </div>
 
-        {/* Prices — all three always visible, centered */}
+        {/* Prices — tick-by-tick when live, otherwise 60s refresh */}
         <div className="flex items-center gap-6 sm:gap-10 flex-1 justify-center">
           {SYMBOLS.map((sym) => (
-            <PriceItem key={sym} symbol={sym} data={prices[sym]} />
+            <PriceItem key={sym} symbol={sym} data={prices[sym]} live={open && liveMode} />
           ))}
         </div>
 

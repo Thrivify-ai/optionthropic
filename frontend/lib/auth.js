@@ -14,6 +14,7 @@ export function saveSession(tokenData) {
       id: tokenData.user_id,
       email: tokenData.email,
       plan: tokenData.plan,
+      is_admin: tokenData.is_admin ?? false,
     }));
   }
 }

@@ -49,6 +49,15 @@ export const analyticsApi = {
     api.get(`/api/alerts/${symbol}?limit=${limit}`).then((r) => r.data),
   marketSummary: (symbol) =>
     api.get(`/api/market-summary/${symbol}`).then((r) => r.data),
+  /** Tick-by-tick prices when Zerodha WebSocket connected. Poll every 5s for live feel. */
+  liveTicks: () =>
+    api.get("/api/live-ticks").then((r) => r.data).catch(() => ({})),
+  /** Persist buy signal for analytics. */
+  saveBuySignal: (body) =>
+    api.post("/api/buy-signal-history", body).then((r) => r.data).catch(() => null),
+  /** Fetch buy signal history for Quick Signals. */
+  buySignalHistory: (symbol) =>
+    api.get("/api/buy-signal-history", { params: symbol ? { symbol } : {} }).then((r) => r.data?.history ?? []).catch(() => []),
   /** No auth required. Returns { token_set, token_valid, bfo_sensex_instruments, message }. */
   zerodhaStatus: () =>
     api.get("/api/zerodha-status").then((r) => r.data).catch(() => ({ token_set: false, token_valid: false, message: "Could not reach backend" })),
@@ -85,6 +94,14 @@ export const analyticsApi = {
   /** Commodities: AI insights (lightweight cached). */
   commodityInsights: (symbol) =>
     api.get(`/api/commodity/insights/${encodeURIComponent(symbol)}`).then((r) => r.data),
+};
+
+export const adminApi = {
+  userStats: () => api.get("/admin/user-stats").then((r) => r.data),
+  usageStats: () => api.get("/admin/usage-stats").then((r) => r.data),
+  systemHealth: () => api.get("/admin/system-health").then((r) => r.data),
+  signalAnalytics: (days = 7, limit = 200) =>
+    api.get("/admin/signal-analytics", { params: { days, limit } }).then((r) => r.data),
 };
 
 export default api;

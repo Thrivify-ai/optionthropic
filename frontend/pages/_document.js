@@ -15,7 +15,7 @@ export default function Document() {
             __html: `
               (function(){
                 try {
-                  var t = localStorage.getItem('or-theme') || 'dark';
+                  var t = localStorage.getItem('ot-theme') || 'dark';
                   document.documentElement.classList.add(t);
                   if (t === 'dark') document.documentElement.classList.remove('light');
                   else              document.documentElement.classList.remove('dark');

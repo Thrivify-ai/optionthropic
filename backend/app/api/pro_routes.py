@@ -16,7 +16,7 @@ from app.analytics.explanation_engine import explain_commodity_signal, explain_s
 from app.analytics.mcx_prices import get_mcx_prices
 from app.analytics.pro_quick_signal import run_pro_quick_signal
 from app.analytics.pro_swing_signal import get_pro_swing_signal
-from app.api.auth_routes import get_current_user
+from app.api.auth_routes import require_pro
 from app.db.database import get_db
 from app.models.user import User
 from app.services.tick_stream import get_latest_ticks
@@ -29,7 +29,7 @@ COMMODITIES = ["CRUDEOIL", "NATGAS", "GOLD", "SILVER"]
 
 @router.get("/ticks")
 async def get_pro_ticks(
-    _: Annotated[User, Depends(get_current_user)],
+    _: Annotated[User, Depends(require_pro)],
 ) -> dict[str, Any]:
     """
     Live tick data for NIFTY, BANKNIFTY, SENSEX.
@@ -39,11 +39,13 @@ async def get_pro_ticks(
     if ticks:
         return {sym: {"price": d["price"], "change": d["change"]} for sym, d in ticks.items()}
 
-    # Fallback: fetch from DB (chain_snapshot latest underlying_price)
+    # Fallback: fetch from DB + Zerodha for yesterday's close when needed
     from sqlalchemy import select, desc
     from app.db.database import AsyncSessionLocal
     from app.models.chain_snapshot import ChainSnapshot
+    from app.analytics.index_quotes import fetch_index_quotes_from_zerodha
 
+    zerodha_quotes = await fetch_index_quotes_from_zerodha()
     out = {}
     async with AsyncSessionLocal() as session:
         for sym in SYMBOLS:
@@ -55,14 +57,15 @@ async def get_pro_ticks(
                     )
                     .where(ChainSnapshot.symbol == sym)
                     .order_by(desc(ChainSnapshot.timestamp))
-                    .limit(2)
+                    .limit(1)
                 )
             ).scalars().all()
             if len(row) >= 1:
                 price = float(row[0][0] or 0)
                 change = 0.0
-                if len(row) >= 2 and row[1][0]:
-                    change = round(price - float(row[1][0]), 2)
+                zq = zerodha_quotes.get(sym, {})
+                if zq.get("prev_close") is not None:
+                    change = round(price - zq["prev_close"], 2)
                 out[sym] = {"price": round(price, 2), "change": change}
     return out
 
@@ -70,7 +73,7 @@ async def get_pro_ticks(
 @router.get("/signals")
 async def get_pro_signals(
     session: Annotated[AsyncSession, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    _: Annotated[User, Depends(require_pro)],
 ) -> dict[str, Any]:
     """
     Combined Pro signals: quick (10s) + swing (DB) + explanation.
@@ -94,7 +97,7 @@ async def get_pro_signals(
 @router.get("/commodities")
 async def get_pro_commodities(
     session: Annotated[AsyncSession, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
+    _: Annotated[User, Depends(require_pro)],
 ) -> dict[str, Any]:
     """
     Combined Pro commodity data: MCX prices + quick signal + long signal + explanation.
@@ -117,6 +120,8 @@ async def get_pro_commodities(
             "change_pct": tick_data.get("change_pct"),
             "quick_signal": q_sig,
             "long_signal": l_sig,
+            "quick_reason": quick_res.get("reason"),
+            "long_reason": long_res.get("reason"),
             "explanation": explain_commodity_signal(q_sig, l_sig),
         }
     return result

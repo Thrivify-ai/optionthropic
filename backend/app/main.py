@@ -42,6 +42,32 @@ async def lifespan(app: FastAPI):
                 error=str(exc),
             )
             await asyncio.sleep(3)
+
+    # Ensure shivraj@thrivify.ai is admin + pro (for existing users)
+    try:
+        from sqlalchemy import select, update
+        from app.api.auth_routes import ADMIN_EMAIL
+        from app.db.database import AsyncSessionLocal
+        from app.models.user import User, UserPlan
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(User).where(User.email == ADMIN_EMAIL)
+            user = (await session.execute(stmt)).scalar_one_or_none()
+            if user and (not user.is_admin or user.plan == UserPlan.FREE):
+                await session.execute(
+                    update(User)
+                    .where(User.email == ADMIN_EMAIL)
+                    .values(is_admin=True, plan=UserPlan.PRO)
+                )
+                await session.commit()
+                logger.info("Ensured admin user", email=ADMIN_EMAIL)
+    except Exception as exc:
+        logger.warning("Admin ensure failed", error=str(exc))
+
+    from app.services.tick_stream import start_tick_stream
+    start_tick_stream()
+    logger.info("Tick stream started (live prices when Zerodha connected)")
+
     collector_task = asyncio.create_task(run_collector())
     logger.info("Options collector started")
     commodity_task = asyncio.create_task(run_commodity_collector())

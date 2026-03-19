@@ -4,7 +4,7 @@ Core analytics API routes.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -247,6 +247,25 @@ async def get_trading_signal(
     }
 
 
+# ─── Live Ticks (tick-by-tick when WebSocket connected) ──────────────────────
+
+@router.get("/live-ticks")
+async def get_live_ticks(
+    _: Annotated[User, Depends(get_current_user)],
+) -> Any:
+    """
+    Return latest tick-by-tick prices from Zerodha WebSocket when connected.
+    Falls back to empty dict — frontend should use /market-prices when empty.
+    """
+    import asyncio
+    from app.services.tick_stream import get_latest_ticks
+
+    ticks = await asyncio.to_thread(get_latest_ticks)
+    if isinstance(ticks, dict) and ticks:
+        return ticks
+    return {}
+
+
 # ─── Market Prices (ticker) ──────────────────────────────────────────────────
 
 @router.get("/market-prices")
@@ -257,24 +276,25 @@ async def get_market_prices(
     """
     Return the latest price + day change for each symbol.
 
-    Base price = last snapshot captured BEFORE today's 9:00 AM IST open.
-    This is the previous trading session's closing price — the same baseline
-    Zerodha and every other platform uses for the day-change percentage.
-
-    Using today's first snapshot as the base would give a misleading "intraday
-    drift from open" rather than the true day change vs yesterday's close.
+    Base price = yesterday's close. Source priority:
+    1. DB: last snapshot before today's 9:00 AM IST (best — our own close)
+    2. Zerodha: ohlc.close from quote API when DB has no pre-market data
     """
     from datetime import timedelta as _td
+
+    from app.analytics.index_quotes import fetch_index_quotes_from_zerodha
 
     _IST = _td(hours=5, minutes=30)
     now_utc      = datetime.now(timezone.utc)
     now_ist      = now_utc + _IST
-    # Today's 9:00 AM IST in UTC
     day_open_utc = (now_ist.replace(hour=9, minute=0, second=0, microsecond=0)) - _IST
 
     result: dict[str, Any] = {}
+    symbols_missing_base: list[str] = []
+    symbols_missing_all: list[str] = []
+
     for symbol in settings.supported_symbols:
-        # ── Latest (current) price ────────────────────────────────────────
+        # ── Latest (current) price from DB ─────────────────────────────────
         latest_price_row = (
             await session.execute(
                 select(ChainSnapshot.underlying_price)
@@ -284,10 +304,7 @@ async def get_market_prices(
             )
         ).scalars().first()
 
-        # ── Previous-close base price ─────────────────────────────────────
-        # Always use the LAST snapshot from before today's open.
-        # That is the most recent price captured while the market was closed
-        # (i.e. end of yesterday's session), which matches Zerodha's reference.
+        # ── Previous-close base: last snapshot before today's open ──────────
         base_price_row = (
             await session.execute(
                 select(ChainSnapshot.underlying_price)
@@ -303,14 +320,42 @@ async def get_market_prices(
         current = float(latest_price_row) if latest_price_row is not None else None
         base    = float(base_price_row)   if base_price_row   is not None else None
 
+        if current is not None and base is None:
+            symbols_missing_base.append(symbol)
+        elif current is None:
+            symbols_missing_all.append(symbol)
+
         change     = round(current - base, 2)          if (current and base) else None
-        change_pct = round(change / base * 100, 2)     if (change is not None and base) else None
+        change_pct = round(change / base * 100, 2)       if (change is not None and base) else None
 
         result[symbol] = {
             "price":      current,
             "change":     change,
             "change_pct": change_pct,
         }
+
+    # ── Fetch from Zerodha when DB has no base (yesterday's close) or no data at all ───
+    need_zerodha = symbols_missing_base or symbols_missing_all
+    if need_zerodha:
+        zerodha_quotes = await fetch_index_quotes_from_zerodha()
+        for symbol in symbols_missing_base:
+            zq = zerodha_quotes.get(symbol, {})
+            z_prev = zq.get("prev_close")
+            z_change = zq.get("change")
+            z_pct = zq.get("change_pct")
+            price = result[symbol].get("price")
+            if z_prev is not None and price is not None:
+                result[symbol]["change"] = z_change or round(price - z_prev, 2)
+                result[symbol]["change_pct"] = z_pct or round(
+                    result[symbol]["change"] / z_prev * 100, 2
+                )
+        for symbol in symbols_missing_all:
+            zq = zerodha_quotes.get(symbol, {})
+            if zq.get("price") is not None:
+                result[symbol]["price"] = zq["price"]
+                result[symbol]["change"] = zq.get("change")
+                result[symbol]["change_pct"] = zq.get("change_pct")
+
     return result
 
 
@@ -391,6 +436,97 @@ async def get_quick_signal_engine_route(
     """
     symbol = _validate_symbol(symbol)
     return await run_quick_signal_engine(session, symbol)
+
+
+# ─── Buy Signal History (persisted for analytics) ──────────────────────────────
+
+from pydantic import BaseModel as _PydanticBase
+
+class BuySignalCreate(_PydanticBase):
+    symbol: str
+    signal: str  # "Buy CE" | "Buy PE"
+    level: float | None = None
+    momentum: float | None = None
+    reason: str | None = None
+
+
+@router.post("/buy-signal-history")
+async def create_buy_signal(
+    body: BuySignalCreate,
+    session: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> Any:
+    """Persist a buy signal for analytics (called when Quick Signal fires Buy CE/PE).
+    Deduplicates: same user+symbol+signal within 90s returns existing row."""
+    from app.models.buy_signal_history import BuySignalHistory
+
+    if body.signal not in ("Buy CE", "Buy PE"):
+        raise HTTPException(status_code=400, detail="signal must be Buy CE or Buy PE")
+    symbol = _validate_symbol(body.symbol)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=90)
+    dup = (
+        select(BuySignalHistory)
+        .where(
+            BuySignalHistory.user_id == current_user.id,
+            BuySignalHistory.symbol == symbol,
+            BuySignalHistory.signal == body.signal,
+            BuySignalHistory.created_at >= cutoff,
+        )
+        .order_by(desc(BuySignalHistory.created_at))
+        .limit(1)
+    )
+    existing = (await session.execute(dup)).scalars().first()
+    if existing:
+        return {"id": existing.id, "symbol": symbol, "signal": body.signal, "created_at": existing.created_at.isoformat()}
+
+    row = BuySignalHistory(
+        user_id=current_user.id,
+        symbol=symbol,
+        signal=body.signal,
+        level=body.level,
+        momentum=body.momentum,
+        reason=body.reason,
+    )
+    session.add(row)
+    await session.flush()
+    return {"id": row.id, "symbol": symbol, "signal": body.signal, "created_at": row.created_at.isoformat()}
+
+
+@router.get("/buy-signal-history")
+async def list_buy_signals(
+    session: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    symbol: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> Any:
+    """List recent buy signals for the current user (for Quick Signals buy history)."""
+    from app.models.buy_signal_history import BuySignalHistory
+
+    stmt = (
+        select(BuySignalHistory)
+        .where(BuySignalHistory.user_id == current_user.id)
+        .order_by(desc(BuySignalHistory.created_at))
+        .limit(limit)
+    )
+    if symbol:
+        stmt = stmt.where(BuySignalHistory.symbol == _validate_symbol(symbol))
+    rows = (await session.execute(stmt)).scalars().all()
+    return {
+        "history": [
+            {
+                "id": r.id,
+                "symbol": r.symbol,
+                "signal": r.signal,
+                "level": float(r.level) if r.level else None,
+                "momentum": float(r.momentum) if r.momentum else None,
+                "reason": r.reason,
+                "time": r.created_at.strftime("%H:%M:%S") if r.created_at else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
 
 
 # ─── Alerts ───────────────────────────────────────────────────────────────────

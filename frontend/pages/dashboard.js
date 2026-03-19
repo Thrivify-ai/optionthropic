@@ -49,6 +49,7 @@ export default function Dashboard() {
   const [tab, setTab]                       = useState("signals");
   const [symbol, setSymbol]                 = useState("NIFTY");
   const [lastDataUpdate, setLastDataUpdate] = useState(null);
+  const [tickerLastUpdate, setTickerLastUpdate] = useState(null);
   const [, setRelativeTick]                 = useState(0);
   const [refreshTick, setRefreshTick]       = useState(0);
   const [movementTick, setMovementTick]     = useState(0);
@@ -108,21 +109,23 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
+  const displayUpdate = marketOpen && tickerLastUpdate ? tickerLastUpdate : lastDataUpdate;
+
   // Relative-time label ticker — only runs while market is open; freezes on close
   useEffect(() => {
-    if (!lastDataUpdate || !marketOpen) return;
+    if (!displayUpdate || !marketOpen) return;
     const id = setInterval(() => setRelativeTick((t) => t + 1), 10_000);
     return () => clearInterval(id);
-  }, [lastDataUpdate, marketOpen]);
+  }, [displayUpdate, marketOpen]);
 
-  const dotClass = lastDataUpdate && marketOpen
+  const dotClass = displayUpdate && marketOpen
     ? "bg-emerald-500 animate-pulse"
     : lastDataUpdate && !marketOpen
       ? "bg-amber-500"
       : "bg-slate-500";
 
   return (
-    <Layout subheader={<MarketTicker refreshTick={refreshTick} />}>
+    <Layout subheader={<MarketTicker refreshTick={refreshTick} onTickerUpdate={setTickerLastUpdate} />}>
       {/* ── Top bar ── */}
       <div className="flex items-center justify-between mb-6 gap-4 flex-wrap">
         <div>
@@ -135,15 +138,15 @@ export default function Dashboard() {
           <div className="flex items-center gap-2 text-xs bg-surface-card/80 border border-surface-border rounded-lg px-3 py-1.5">
             <span className={`inline-block h-2 w-2 rounded-full ${dotClass}`} title="Data status" />
             <span className="text-slate-400">
-              {lastDataUpdate ? (
+              {displayUpdate ? (
                 <>
                   {marketOpen ? "Live" : "Closed at"}:{" "}
                   <span className="text-slate-200 font-medium">
-                    {lastDataUpdate.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}
+                    {displayUpdate.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}
                   </span>
                   {/* Show relative time only while market is open */}
                   {marketOpen && (
-                    <span className="ml-1 text-slate-500">({formatRelative(lastDataUpdate)})</span>
+                    <span className="ml-1 text-slate-500">({formatRelative(displayUpdate)})</span>
                   )}
                 </>
               ) : (
@@ -176,7 +179,6 @@ export default function Dashboard() {
       {/* ══ TAB 1 — SIGNALS ══════════════════════════════════════════ */}
       {tab === "signals" && (
         <div className="space-y-8">
-          <TimeFactorCard symbol="NIFTY" refreshTick={refreshTick} onDataLoaded={onDataLoaded} />
           <div className="space-y-3">
             <SectionLabel number="⚡" title="Quick Signals" />
             <QuickSignalsCard />
@@ -193,6 +195,7 @@ export default function Dashboard() {
             <SectionLabel number="3" title="AI Market Insights" />
             <AIInsightsPanel onDataLoaded={onDataLoaded} refreshTick={movementTick} />
           </div>
+          <TimeFactorCard symbol="NIFTY" refreshTick={refreshTick} onDataLoaded={onDataLoaded} />
         </div>
       )}
 

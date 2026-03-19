@@ -179,17 +179,12 @@ def start_tick_stream():
 
 def get_latest_ticks() -> dict[str, dict[str, Any]]:
     """Return latest ticks for all indices. Change = current - previous close."""
-    if settings.zerodha_api_key and settings.zerodha_access_token:
-        if not _ref_price and not _tick_store:
-            _refresh_ref_prices()
-        if not _tick_store:
-            start_tick_stream()
-            time.sleep(2)
-
     if _tick_store:
         return dict(_tick_store)
 
-    # Fallback: use kite.quote() when WebSocket has no data
+    # No WebSocket data — try kite.quote() immediately (faster than waiting for ticks)
+    if not settings.zerodha_api_key or not settings.zerodha_access_token:
+        return {}
     try:
         from kiteconnect import KiteConnect
         kite = KiteConnect(api_key=settings.zerodha_api_key)

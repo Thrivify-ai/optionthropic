@@ -11,6 +11,7 @@ const NAV = [
   { href: "/profile",   label: "Profile"   },
   { href: "/settings",  label: "Settings"  },
 ];
+const ADMIN_NAV = [{ href: "/admin/analytics", label: "Signal Analytics" }];
 
 function SunIcon() {
   return (
@@ -51,7 +52,7 @@ export default function Layout({ children, subheader }) {
 
   // Load persisted theme once on mount and apply to <html>
   useEffect(() => {
-    const saved = localStorage.getItem("or-theme") || "dark";
+    const saved = localStorage.getItem("ot-theme") || "dark";
     applyTheme(saved);
     setTheme(saved);
   }, []);
@@ -71,7 +72,7 @@ export default function Layout({ children, subheader }) {
     const next = theme === "dark" ? "light" : "dark";
     applyTheme(next);
     setTheme(next);
-    localStorage.setItem("or-theme", next);
+    localStorage.setItem("ot-theme", next);
   }
 
   const logout = () => {
@@ -87,7 +88,7 @@ export default function Layout({ children, subheader }) {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
           <Link href="/dashboard" className="flex items-center gap-2">
             <span className="h-7 w-7 rounded-lg bg-brand-600 flex items-center justify-center text-white font-bold text-sm">
-              OR
+              OT
             </span>
             <span className="font-bold text-slate-100 tracking-tight">
               Optionthropic
@@ -96,16 +97,12 @@ export default function Layout({ children, subheader }) {
 
           <nav className="hidden md:flex items-center gap-1">
             {NAV.map(({ href, label }) => (
-              <Link
-                key={href}
-                href={href}
-                className={clsx(
-                  "px-3 py-1.5 rounded-lg text-sm transition-colors",
-                  router.pathname === href
-                    ? "bg-brand-600/20 text-brand-400"
-                    : "text-slate-400 hover:text-slate-100 hover:bg-white/5"
-                )}
-              >
+              <Link key={href} href={href} className={clsx("px-3 py-1.5 rounded-lg text-sm transition-colors", router.pathname === href ? "bg-brand-600/20 text-brand-400" : "text-slate-400 hover:text-slate-100 hover:bg-white/5")}>
+                {label}
+              </Link>
+            ))}
+            {user?.is_admin && ADMIN_NAV.map(({ href, label }) => (
+              <Link key={href} href={href} className={clsx("px-3 py-1.5 rounded-lg text-sm transition-colors border border-amber-500/30", router.pathname === href ? "bg-amber-500/20 text-amber-400" : "text-amber-600 hover:text-amber-400 hover:bg-amber-500/10")}>
                 {label}
               </Link>
             ))}
@@ -115,7 +112,12 @@ export default function Layout({ children, subheader }) {
             {user && (
               <span className="text-xs text-slate-500 hidden sm:block">
                 {user.email}
-                <span className="ml-1.5 badge-blue">{user.plan}</span>
+                {user.is_admin && (
+                  <span className="ml-1.5 badge-yellow">Admin</span>
+                )}
+                {!user.is_admin && (
+                  <span className="ml-1.5 badge-blue">{user.plan}</span>
+                )}
               </span>
             )}
 

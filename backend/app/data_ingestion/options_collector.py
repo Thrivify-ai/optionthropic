@@ -158,7 +158,12 @@ async def run_collector() -> None:
     )
 
     while True:
-        if _is_market_open():
+        # NSE returns last trading day's data 24/7 — always fetch. Zerodha/Angel only when market open.
+        should_fetch = (
+            _is_market_open()
+            or settings.data_source == "NSE"
+        )
+        if should_fetch:
             try:
                 for sym in settings.supported_symbols:
                     try:
@@ -185,6 +190,9 @@ async def run_collector() -> None:
             except Exception as exc:
                 logger.warning("Signal engine failed (will retry next cycle)", error=str(exc))
         else:
-            logger.info("Market closed — skipping Zerodha fetch and signal evaluation")
+            logger.info(
+                "Market closed — skipping fetch",
+                data_source=settings.data_source,
+            )
 
         await asyncio.sleep(settings.poll_interval_seconds)

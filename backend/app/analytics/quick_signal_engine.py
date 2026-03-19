@@ -31,17 +31,18 @@ from app.models.chain_snapshot import ChainSnapshot
 logger = get_logger(__name__)
 
 
-# ─── Per-symbol thresholds (30–40 pt equivalent) ──────────────────────────────
-# bull_mom/bear_mom: 1-minute move threshold
-# mom_3m: 3-minute move threshold — catches sustained moves (e.g. 100 pts over 2–3 min)
-#         when 1m window shows less
+# ─── Per-symbol thresholds ─────────────────────────────────────────────────────
+# Relaxed from original 35/80/60 to catch more realistic intraday moves.
+# With 45s poll, "1m" ≈ 45–90s; "3m" ≈ 2.5–4 min. Points are index pts.
+# Added pct_min: 0.08% = ~20 pts at NIFTY 24k — catches smaller but tradeable moves.
+# "Soft" path: 50% of threshold + (breakout or vol_spike or OI) also fires.
 
 _SYMBOL_CONFIG: dict[str, dict] = {
-    "NIFTY":     {"bull_mom":  35, "bear_mom":  -35, "mom_3m":  25, "band_pct": 0.020},
-    "BANKNIFTY": {"bull_mom":  80, "bear_mom":  -80, "mom_3m":  55, "band_pct": 0.020},
-    "SENSEX":    {"bull_mom":  60, "bear_mom":  -60, "mom_3m":  50, "band_pct": 0.015},
+    "NIFTY":     {"bull_mom":  18, "bear_mom":  -18, "mom_3m":  12, "soft_ratio": 0.5, "pct_min": 0.0006, "band_pct": 0.020},
+    "BANKNIFTY": {"bull_mom":  45, "bear_mom":  -45, "mom_3m":  30, "soft_ratio": 0.5, "pct_min": 0.0006, "band_pct": 0.020},
+    "SENSEX":    {"bull_mom":  30, "bear_mom":  -30, "mom_3m":  22, "soft_ratio": 0.5, "pct_min": 0.0004, "band_pct": 0.015},
 }
-_DEFAULT_CONFIG: dict[str, Any] = {"bull_mom": 40, "bear_mom": -40, "mom_3m": 30, "band_pct": 0.020}
+_DEFAULT_CONFIG: dict[str, Any] = {"bull_mom": 22, "bear_mom": -22, "mom_3m": 15, "soft_ratio": 0.5, "pct_min": 0.0006, "band_pct": 0.020}
 _VOLUME_SPIKE_RATIO = 1.5   # current-minute volume must exceed 1.5× avg minute volume
 
 
@@ -176,14 +177,14 @@ async def run_quick_signal_engine(session: AsyncSession,
 
     ts_now = timestamps[0]
 
-    # ~1-minute-ago: first timestamp at least 55 s before ts_now
+    # ~1-minute-ago: first timestamp at least 45 s before ts_now (align with poll interval)
     ts_1m = next(
-        (t for t in timestamps[1:] if (ts_now - t).total_seconds() >= 55),
+        (t for t in timestamps[1:] if (ts_now - t).total_seconds() >= 40),
         timestamps[1],
     )
-    # ~3-minute-ago
+    # ~2-minute-ago: 100s so we reliably get data with 45s poll (3 snapshots ≈ 2 min)
     ts_3m = next(
-        (t for t in timestamps[1:] if (ts_now - t).total_seconds() >= 175),
+        (t for t in timestamps[1:] if (ts_now - t).total_seconds() >= 100),
         None,
     )
 
@@ -203,11 +204,16 @@ async def run_quick_signal_engine(session: AsyncSession,
         session, symbol, ts_now, spot, cfg["band_pct"])
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # STEP 1 — Momentum
+    # STEP 1 — Momentum (relaxed: points or % move; soft path with confirmation)
     # ═══════════════════════════════════════════════════════════════════════════
     momentum_1m    = round(spot - prev_1m["price"], 2)
-    strong_bullish = momentum_1m >= cfg["bull_mom"]
-    strong_bearish = momentum_1m <= cfg["bear_mom"]
+    pct_1m         = (momentum_1m / prev_1m["price"] * 100) if prev_1m["price"] else 0
+    pct_min        = cfg.get("pct_min", 0.0008) * 100  # as percentage
+    soft_ratio     = cfg.get("soft_ratio", 0.5)
+    soft_bull      = momentum_1m >= cfg["bull_mom"] * soft_ratio or pct_1m >= pct_min
+    soft_bear      = momentum_1m <= cfg["bear_mom"] * soft_ratio or pct_1m <= -pct_min
+    strong_bullish = momentum_1m >= cfg["bull_mom"] or (pct_1m >= pct_min and momentum_1m > 0)
+    strong_bearish = momentum_1m <= cfg["bear_mom"] or (pct_1m <= -pct_min and momentum_1m < 0)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2 — Volume spike
@@ -331,10 +337,16 @@ async def run_quick_signal_engine(session: AsyncSession,
             "timestamp":     datetime.now(timezone.utc).isoformat(),
         }
 
-    # ── Momentum-first triggers (primary: 30–40 pt move detected) ─────────────
+    # ── Soft path: 50% momentum + confirmation (breakout/vol/OI) ─────────────
+    has_bull_conf = bullish_breakout or volume_spike or oi_bullish
+    has_bear_conf = bearish_breakdown or volume_spike or oi_bearish
+    soft_bull_ok = soft_bull and (momentum_3m is None or momentum_3m > 0) and has_bull_conf
+    soft_bear_ok = soft_bear and (momentum_3m is None or momentum_3m < 0) and has_bear_conf
+
+    # ── Momentum-first triggers ───────────────────────────────────────────────
     # Fire when momentum ≥ threshold and 3m same direction; trap filter only.
-    # OI/volume/breakout are bonuses for reason text, not required.
-    if bullish_trend_ok and not trap_bull:
+    # Soft path: 50% threshold + breakout/vol/OI also fires.
+    if (bullish_trend_ok or soft_bull_ok) and not trap_bull:
         ext = []
         if bullish_breakout:
             ext.append(f"breakout above {int(resistance):,}")
@@ -354,7 +366,7 @@ async def run_quick_signal_engine(session: AsyncSession,
             ),
         )
 
-    if bearish_trend_ok and not trap_bear:
+    if (bearish_trend_ok or soft_bear_ok) and not trap_bear:
         ext = []
         if bearish_breakdown:
             ext.append(f"breakdown below {int(support):,}")
@@ -378,10 +390,12 @@ async def run_quick_signal_engine(session: AsyncSession,
     missing: list[str] = []
     if trap_bull or trap_bear:
         missing.append("liquidity trap (reversal after move)")
-    if not bullish_trend_ok and not bearish_trend_ok:
-        m1 = f"1m {momentum_1m:+.0f} (need ±{cfg['bull_mom']})"
+    elif not bullish_trend_ok and not bearish_trend_ok and not soft_bull_ok and not soft_bear_ok:
+        m1 = f"1m {momentum_1m:+.0f} (need ±{cfg['bull_mom']} or {pct_min:.2f}%)"
         m3 = f"3m {momentum_3m:+.0f} (need ±{int(mom_3m_thresh)})" if momentum_3m is not None else ""
         missing.append(f"momentum: {m1}" + (f" · {m3}" if m3 else ""))
+    elif (soft_bull and not has_bull_conf) or (soft_bear and not has_bear_conf):
+        missing.append("momentum ok but need breakout/vol/OI confirmation")
     elif momentum_3m is not None and (
         (strong_bullish and momentum_3m <= 0) or (strong_bearish and momentum_3m >= 0)
     ):
