@@ -38,8 +38,16 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     ai_provider: Literal["openai", "anthropic", "bedrock"] = "openai"
     ai_cache_ttl_seconds: int = 300
+    ai_cache_ttl_market_open_seconds: int = 300
+    ai_cache_ttl_market_closed_seconds: int = 21600
     bedrock_model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0"
     bedrock_region: str = "ap-south-1"
+
+    # Shared cache
+    redis_url: str = ""
+    dashboard_cache_ttl_market_open_seconds: int = 15
+    dashboard_cache_ttl_market_closed_seconds: int = 14400
+    startup_warm_caches: bool = True
 
     # AWS
     aws_region: str = "ap-south-1"

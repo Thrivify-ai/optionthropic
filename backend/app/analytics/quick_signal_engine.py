@@ -26,6 +26,7 @@ from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.logging_config import get_logger
+from app.analytics.quick_signal_utils import has_directional_persistence, is_quick_rangebound
 from app.models.chain_snapshot import ChainSnapshot
 
 logger = get_logger(__name__)
@@ -278,10 +279,12 @@ async def run_quick_signal_engine(session: AsyncSession,
 
     # 3-minute context (optional but improves quality)
     momentum_3m = None
+    momentum_prev_leg = None
     if ts_3m is not None:
         prev_3m = await _snap(session, symbol, ts_3m)
         if prev_3m and prev_3m["price"]:
             momentum_3m = round(spot - prev_3m["price"], 2)
+            momentum_prev_leg = round(prev_1m["price"] - prev_3m["price"], 2)
 
     # Liquidity-trap: breakout occurred but price snapped back within ~2 minutes
     # (approximation using the 1m-ago snapshot)
@@ -306,6 +309,23 @@ async def run_quick_signal_engine(session: AsyncSession,
     mom_3m_thresh = cfg.get("mom_3m", cfg["bull_mom"] * 0.7)
     strong_bullish_3m = momentum_3m is not None and momentum_3m >= mom_3m_thresh
     strong_bearish_3m = momentum_3m is not None and momentum_3m <= -mom_3m_thresh
+
+    if is_quick_rangebound(
+        spot,
+        support,
+        resistance,
+        momentum_1m,
+        momentum_3m,
+        cfg["bull_mom"],
+        mom_3m_thresh,
+    ):
+        return _wait(
+            symbol,
+            "Waiting — price is still rangebound inside support/resistance with weak momentum",
+            support=support,
+            resistance=resistance,
+            current_price=spot,
+        )
 
     bullish_trend_ok = (
         (strong_bullish and (momentum_3m is None or momentum_3m > 0))
@@ -346,7 +366,10 @@ async def run_quick_signal_engine(session: AsyncSession,
     # ── Momentum-first triggers ───────────────────────────────────────────────
     # Fire when momentum ≥ threshold and 3m same direction; trap filter only.
     # Soft path: 50% threshold + breakout/vol/OI also fires.
-    if (bullish_trend_ok or soft_bull_ok) and not trap_bull:
+    bullish_persistent = has_directional_persistence(momentum_1m, momentum_prev_leg, "bullish")
+    bearish_persistent = has_directional_persistence(momentum_1m, momentum_prev_leg, "bearish")
+
+    if (bullish_trend_ok or soft_bull_ok) and bullish_persistent and not trap_bull:
         ext = []
         if bullish_breakout:
             ext.append(f"breakout above {int(resistance):,}")
@@ -366,7 +389,7 @@ async def run_quick_signal_engine(session: AsyncSession,
             ),
         )
 
-    if (bearish_trend_ok or soft_bear_ok) and not trap_bear:
+    if (bearish_trend_ok or soft_bear_ok) and bearish_persistent and not trap_bear:
         ext = []
         if bearish_breakdown:
             ext.append(f"breakdown below {int(support):,}")
@@ -400,6 +423,8 @@ async def run_quick_signal_engine(session: AsyncSession,
         (strong_bullish and momentum_3m <= 0) or (strong_bearish and momentum_3m >= 0)
     ):
         missing.append("3m momentum opposite to 1m (not sustained)")
+    elif ((bullish_trend_ok or soft_bull_ok) and not bullish_persistent) or ((bearish_trend_ok or soft_bear_ok) and not bearish_persistent):
+        missing.append("direction has not persisted across the prior momentum leg")
 
     reason = "Waiting — " + ", ".join(missing) if missing else "No significant move detected"
 

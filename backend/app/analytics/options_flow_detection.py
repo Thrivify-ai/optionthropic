@@ -19,6 +19,7 @@ import pandas as pd
 from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.foundation_utils import determine_dominant_flow
 from app.models.options_snapshot import OptionsSnapshot
 from app.models.options_flow import OptionsFlow, FlowSide, FlowType
 from app.logging_config import get_logger
@@ -44,7 +45,6 @@ def _classify_flow(
     if oi > 0 and (volume / oi) >= UNUSUAL_VOLUME_OI_RATIO:
         return FlowType.UNUSUAL
     return FlowType.NORMAL
-
 
 async def detect_options_flow(
     session: AsyncSession, symbol: str, top_n: int = 20
@@ -135,6 +135,10 @@ async def detect_options_flow(
     }
     summary["premium_ratio"] = round(
         summary["total_put_premium"] / (summary["total_call_premium"] + 1), 4
+    )
+    summary["dominant_flow"] = determine_dominant_flow(
+        summary["total_call_premium"],
+        summary["total_put_premium"],
     )
 
     return {

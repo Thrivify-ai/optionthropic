@@ -4,6 +4,7 @@ import Cookies from "js-cookie";
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 const api = axios.create({ baseURL: BASE_URL });
+let dashboardOverviewCache = { ts: 0, promise: null };
 
 api.interceptors.request.use((config) => {
   const token = Cookies.get("token");
@@ -31,6 +32,18 @@ export const authApi = {
 };
 
 export const analyticsApi = {
+  dashboardOverview: (force = false) => {
+    const now = Date.now();
+    if (!force && dashboardOverviewCache.promise && now - dashboardOverviewCache.ts < 3000) {
+      return dashboardOverviewCache.promise;
+    }
+    dashboardOverviewCache.ts = now;
+    dashboardOverviewCache.promise = api
+      .get("/api/dashboard-overview")
+      .then((r) => r.data)
+      .catch(() => ({ symbols: {} }));
+    return dashboardOverviewCache.promise;
+  },
   optionsChain: (symbol) =>
     api.get(`/api/options-chain/${symbol}`).then((r) => r.data),
   supportResistance: (symbol) =>

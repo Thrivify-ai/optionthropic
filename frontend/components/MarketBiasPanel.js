@@ -108,32 +108,7 @@ function deriveAll(pcr, gamma, mp, traps, flow) {
 
 // ─── Single index card ────────────────────────────────────────────────────────
 
-function SentimentCard({ symbol, zerodhaStatus, onDataLoaded, refreshTick }) {
-  const [raw, setRaw]       = useState(null);
-  const [loading, setLoad]  = useState(true);
-  const [noData, setNoData] = useState(false);
-
-  useEffect(() => {
-    if (!symbol) return;
-    const firstLoad = !raw;
-    if (firstLoad) setLoad(true);
-    Promise.all([
-      analyticsApi.optionsChain(symbol).catch(() => null),
-      analyticsApi.gammaWalls(symbol).catch(() => null),
-      analyticsApi.maxPain(symbol).catch(() => null),
-      analyticsApi.liquidityTraps(symbol).catch(() => null),
-      analyticsApi.optionsFlow(symbol).catch(() => null),
-    ]).then(([chain, gamma, mp, traps, flow]) => {
-      const spot = Number(gamma?.underlying_price || chain?.support_resistance?.underlying_price || 0);
-      if (!spot) { setNoData(true); setLoad(false); return; }
-      setRaw({ pcr: chain?.pcr, sr: chain?.support_resistance, gamma, mp, traps, flow });
-      if (firstLoad) setLoad(false);
-      onDataLoaded?.();
-    });
-  // refreshTick drives re-fetches on the same 60 s heartbeat as the ticker
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, refreshTick]);
-
+function SentimentCard({ symbol, zerodhaStatus, raw, loading, noData }) {
   if (loading) return (
     <div className="card animate-pulse min-h-[320px] flex flex-col gap-3 p-5 shadow-lg shadow-black/10">
       <div className="h-4 bg-surface-border/50 rounded w-20" />
@@ -251,9 +226,22 @@ function SentimentCard({ symbol, zerodhaStatus, onDataLoaded, refreshTick }) {
 
 export default function MarketBiasPanel({ onDataLoaded, refreshTick }) {
   const [zerodhaStatus, setZerodhaStatus] = useState(null);
+  const [overview, setOverview] = useState({});
+  const [loading, setLoading] = useState(true);
   useEffect(() => {
     analyticsApi.zerodhaStatus().then(setZerodhaStatus);
   }, []);
+  useEffect(() => {
+    const first = Object.keys(overview).length === 0;
+    if (first) setLoading(true);
+    analyticsApi.dashboardOverview().then((data) => {
+      setOverview(data?.symbols || {});
+      onDataLoaded?.();
+    }).finally(() => {
+      if (first) setLoading(false);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshTick]);
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
       {SYMBOLS.map(s => (
@@ -261,8 +249,16 @@ export default function MarketBiasPanel({ onDataLoaded, refreshTick }) {
           key={s}
           symbol={s}
           zerodhaStatus={zerodhaStatus}
-          onDataLoaded={onDataLoaded}
-          refreshTick={refreshTick}
+          raw={overview[s] ? {
+            pcr: overview[s]?.options_chain?.pcr,
+            sr: overview[s]?.options_chain?.support_resistance,
+            gamma: overview[s]?.gamma_walls,
+            mp: overview[s]?.max_pain,
+            traps: overview[s]?.liquidity_traps,
+            flow: overview[s]?.options_flow,
+          } : null}
+          loading={loading}
+          noData={!loading && !overview[s]}
         />
       ))}
     </div>

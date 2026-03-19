@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai_engine.market_explainer import explain_market
 from app.alerts.alert_engine import run_alert_evaluation
+from app.analytics.dashboard_cache import get_dashboard_overview
 from app.analytics.gamma_detection import compute_gamma_walls
 from app.analytics.liquidity_trap_detection import detect_liquidity_traps
 from app.analytics.max_pain_detection import compute_max_pain
@@ -47,6 +48,14 @@ def _validate_symbol(symbol: str) -> str:
             detail=f"Symbol must be one of: {settings.supported_symbols}",
         )
     return symbol
+
+
+@router.get("/dashboard-overview")
+async def get_dashboard_overview_route(
+    session: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[User, Depends(get_current_user)],
+) -> Any:
+    return await get_dashboard_overview(session)
 
 
 # ─── Options Chain ────────────────────────────────────────────────────────────

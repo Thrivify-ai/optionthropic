@@ -20,6 +20,8 @@ from app.data_ingestion.commodity_collector import run_commodity_collector
 from app.data_ingestion.options_collector import run_collector
 from app.db.database import create_all_tables
 from app.logging_config import configure_logging, get_logger
+from app.services.cache_warmers import warm_startup_caches
+from app.services.runtime_cache import runtime_cache
 
 configure_logging()
 logger = get_logger(__name__)
@@ -68,6 +70,12 @@ async def lifespan(app: FastAPI):
     start_tick_stream()
     logger.info("Tick stream started (live prices when Zerodha connected)")
 
+    await runtime_cache.start()
+    warmers_task = None
+    if settings.startup_warm_caches:
+        warmers_task = asyncio.create_task(warm_startup_caches())
+        logger.info("Startup cache warmers scheduled")
+
     collector_task = asyncio.create_task(run_collector())
     logger.info("Options collector started")
     commodity_task = asyncio.create_task(run_commodity_collector())
@@ -85,6 +93,13 @@ async def lifespan(app: FastAPI):
         await commodity_task
     except asyncio.CancelledError:
         pass
+    if warmers_task is not None:
+        warmers_task.cancel()
+        try:
+            await warmers_task
+        except asyncio.CancelledError:
+            pass
+    await runtime_cache.close()
     logger.info("Optionthropic shutdown complete")
 
 

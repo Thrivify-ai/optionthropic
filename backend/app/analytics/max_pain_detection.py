@@ -20,6 +20,7 @@ import pandas as pd
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.foundation_utils import select_representative_expiry
 from app.models.chain_snapshot import ChainSnapshot
 from app.logging_config import get_logger
 
@@ -40,7 +41,6 @@ def _compute_max_pain(df: pd.DataFrame) -> float:
             max_pain = s
 
     return float(max_pain)
-
 
 async def compute_max_pain(
     session: AsyncSession,
@@ -83,25 +83,32 @@ async def compute_max_pain(
     spot = float(valid.median() if not valid.empty else df["underlying_price"].iloc[0])
 
     # Compute per expiry
-    results = []
+    results: list[dict[str, Any]] = []
     for exp, group in df.groupby("expiry"):
         mp = _compute_max_pain(group)
         deviation_pct = round((mp - spot) / spot * 100, 2)
         results.append(
             {
-                "expiry": str(exp),
+                "expiry": exp,
                 "max_pain_strike": mp,
                 "deviation_from_spot_pct": deviation_pct,
             }
         )
 
-    nearest = min(results, key=lambda x: x["max_pain_strike"])
+    nearest = select_representative_expiry(results)
 
     return {
         "symbol": symbol,
         "underlying_price": float(spot),
         "max_pain_strike": nearest["max_pain_strike"],
         "deviation_from_spot_pct": nearest["deviation_from_spot_pct"],
-        "by_expiry": results,
+        "by_expiry": [
+            {
+                "expiry": str(row["expiry"]),
+                "max_pain_strike": row["max_pain_strike"],
+                "deviation_from_spot_pct": row["deviation_from_spot_pct"],
+            }
+            for row in sorted(results, key=lambda row: row["expiry"])
+        ],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

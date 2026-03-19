@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alerts.alert_engine import run_all_symbols
+from app.analytics.dashboard_cache import refresh_dashboard_snapshot_cache
+from app.analytics.feature_builder import run_feature_snapshot_cycle
 from app.analytics.signal_runner import run_signal_engine_cycle
 from app.config import settings
 from app.data_ingestion.data_source_router import get_data_source
@@ -22,19 +24,13 @@ from app.db.database import AsyncSessionLocal
 from app.logging_config import get_logger
 from app.models.chain_snapshot import ChainSnapshot
 from app.models.options_snapshot import OptionsSnapshot
+from app.services.market_hours import should_refresh_intraday_caches
 
 logger = get_logger(__name__)
 
-# IST = UTC+5:30
-_IST_OFFSET = timedelta(hours=5, minutes=30)
-_MARKET_OPEN  = dtime(9, 0)
-_MARKET_CLOSE = dtime(15, 30)
-
-
 def _is_market_open() -> bool:
-    """Return True if current IST time is within 9:00–15:30."""
-    now_ist = (datetime.now(timezone.utc) + _IST_OFFSET).time()
-    return _MARKET_OPEN <= now_ist <= _MARKET_CLOSE
+    """Return True when the Indian cash market session is open."""
+    return should_refresh_intraday_caches()
 
 
 # ─── SQS publisher ─────────────────────────────────────────────────────────────
@@ -141,6 +137,8 @@ async def _collect_symbol(symbol: str) -> None:
 
     async with AsyncSessionLocal() as session:
         await _persist_snapshots(session, symbol, records)
+        if underlying:
+            await run_feature_snapshot_cycle(session, symbol, datetime.now(timezone.utc), float(underlying))
         await session.commit()
 
     logger.info("Persisted snapshots", symbol=symbol, count=len(records))
@@ -189,6 +187,11 @@ async def run_collector() -> None:
                 await run_signal_engine_cycle()
             except Exception as exc:
                 logger.warning("Signal engine failed (will retry next cycle)", error=str(exc))
+
+            try:
+                await refresh_dashboard_snapshot_cache()
+            except Exception as exc:
+                logger.warning("Dashboard snapshot cache refresh failed (will retry next cycle)", error=str(exc))
         else:
             logger.info(
                 "Market closed — skipping fetch",

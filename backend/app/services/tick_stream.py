@@ -7,7 +7,6 @@ Stores latest ticks in memory. Falls back to DB/quote polling when unavailable.
 
 from __future__ import annotations
 
-import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -29,11 +28,13 @@ _INDEX_KEYS = {
 _tick_store: dict[str, dict[str, Any]] = {}
 # Rolling 30-second price history for 10s momentum: { symbol: deque of (ts, price) }
 _tick_history: dict[str, deque] = {}
+import threading
+
 _history_lock = threading.Lock()
 
 # Previous day close (or today's open) — reference for change calculation
 _ref_price: dict[str, float] = {}
-_kite_ticker_thread: threading.Thread | None = None
+_kite_ticker_client: Any | None = None
 _ws_connected = False
 
 
@@ -140,14 +141,17 @@ def _on_connect(ws, response):
 
 
 def _on_close(ws, code, reason):
-    global _ws_connected
+    global _kite_ticker_client, _ws_connected
     _ws_connected = False
+    _kite_ticker_client = None
     logger.info("Pro tick stream WebSocket closed", code=code, reason=reason)
 
 
-def _run_kite_ticker():
-    """Run KiteTicker in a blocking loop (runs in thread)."""
-    global _kite_ticker_thread
+def start_tick_stream():
+    """Start the tick stream WebSocket using KiteTicker's threaded mode."""
+    global _kite_ticker_client
+    if _kite_ticker_client is not None:
+        return
     if not settings.zerodha_api_key or not settings.zerodha_access_token:
         return
     tokens = _get_tokens()
@@ -156,25 +160,17 @@ def _run_kite_ticker():
         return
     try:
         from kiteconnect import KiteTicker
+
         kws = KiteTicker(settings.zerodha_api_key, settings.zerodha_access_token)
         kws.on_ticks = _on_ticks
         kws.on_connect = _on_connect
         kws.on_close = _on_close
-        kws.connect(threaded=False)
+        kws.connect(threaded=True)
+        _kite_ticker_client = kws
+        logger.info("Pro tick stream connection initiated")
     except Exception as e:
+        _kite_ticker_client = None
         logger.warning("Pro tick stream KiteTicker failed", error=str(e))
-    finally:
-        _kite_ticker_thread = None
-
-
-def start_tick_stream():
-    """Start the tick stream WebSocket in a background thread."""
-    global _kite_ticker_thread
-    if _kite_ticker_thread and _kite_ticker_thread.is_alive():
-        return
-    _kite_ticker_thread = threading.Thread(target=_run_kite_ticker, daemon=True)
-    _kite_ticker_thread.start()
-    logger.info("Pro tick stream thread started")
 
 
 def get_latest_ticks() -> dict[str, dict[str, Any]]:

@@ -51,6 +51,10 @@ async def create_all_tables() -> None:
         user_events,
         trading_signal,
         buy_signal_history,
+        underlying_bar,
+        signal_feature_snapshot,
+        dashboard_snapshot_cache,
+        market_summary_cache,
     )
 
     async with engine.begin() as conn:

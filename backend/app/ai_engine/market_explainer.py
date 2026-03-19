@@ -11,6 +11,7 @@ minimise API costs during high-traffic periods.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,18 +23,24 @@ from app.analytics.options_analysis import compute_pcr, compute_support_resistan
 from app.analytics.options_flow_detection import detect_options_flow
 from app.analytics.positioning_shift import detect_positioning_shifts
 from app.config import settings
+from app.db.database import AsyncSessionLocal
 from app.logging_config import get_logger
+from app.models.market_summary_cache import MarketSummaryCache
+from app.services.market_hours import ai_cache_ttl_seconds, should_refresh_intraday_caches
+from app.services.runtime_cache import runtime_cache
 
 logger = get_logger(__name__)
+MARKET_SUMMARY_CACHE_KEY_PREFIX = "market-summary"
 
 # ─── Simple in-process cache ───────────────────────────────────────────────────
 _cache: dict[str, tuple[float, str]] = {}
+_refresh_inflight: set[str] = set()
 
 
 def _get_cached(symbol: str) -> str | None:
     if symbol in _cache:
         ts, value = _cache[symbol]
-        if time.monotonic() - ts < settings.ai_cache_ttl_seconds:
+        if time.monotonic() - ts < ai_cache_ttl_seconds():
             return value
     return None
 
@@ -42,36 +49,119 @@ def _set_cache(symbol: str, value: str) -> None:
     _cache[symbol] = (time.monotonic(), value)
 
 
+def _has_ai_credentials() -> bool:
+    return bool(
+        settings.openai_api_key
+        or settings.anthropic_api_key
+        or (settings.ai_provider == "bedrock" and settings.aws_access_key_id)
+    )
+
+
+async def get_cached_market_summary_row(session: AsyncSession, symbol: str) -> MarketSummaryCache | None:
+    row = await session.get(MarketSummaryCache, symbol)
+    if row is None or row.generated_at is None:
+        return None
+
+    generated_at = row.generated_at
+    if generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - generated_at > timedelta(seconds=ai_cache_ttl_seconds()):
+        return None
+    return row
+
+
+async def get_latest_market_summary_row(session: AsyncSession, symbol: str) -> MarketSummaryCache | None:
+    return await session.get(MarketSummaryCache, symbol)
+
+
+def _market_summary_cache_key(symbol: str) -> str:
+    return f"{MARKET_SUMMARY_CACHE_KEY_PREFIX}:{symbol}:v1"
+
+
+def _summary_payload(
+    symbol: str,
+    insight: str,
+    *,
+    cached: bool,
+    pending: bool = False,
+    generated_at: datetime | None = None,
+    stale: bool = False,
+) -> dict[str, Any]:
+    payload = {
+        "symbol": symbol,
+        "insight": insight,
+        "cached": cached,
+        "pending": pending,
+        "generated_at": generated_at.isoformat() if generated_at else None,
+    }
+    if stale:
+        payload["stale"] = True
+    return payload
+
+
+async def _cache_market_summary_payload(symbol: str, payload: dict[str, Any], now_utc: datetime | None = None) -> None:
+    await runtime_cache.set_json(
+        _market_summary_cache_key(symbol),
+        payload,
+        ttl_seconds=ai_cache_ttl_seconds(now_utc),
+    )
+
+
+async def _persist_market_summary(
+    session: AsyncSession,
+    symbol: str,
+    insight: str,
+    source_timestamp: datetime | None = None,
+) -> None:
+    row = await session.get(MarketSummaryCache, symbol)
+    model_id = settings.bedrock_model_id if settings.ai_provider == "bedrock" else settings.ai_provider
+    if row is None:
+        session.add(
+            MarketSummaryCache(
+                symbol=symbol,
+                insight=insight,
+                provider=settings.ai_provider,
+                model_id=model_id,
+                cached=True,
+                source_timestamp=source_timestamp,
+                generated_at=datetime.now(timezone.utc),
+            )
+        )
+    else:
+        row.insight = insight
+        row.provider = settings.ai_provider
+        row.model_id = model_id
+        row.cached = True
+        row.source_timestamp = source_timestamp
+        row.generated_at = datetime.now(timezone.utc)
+
+
 # ─── Prompt builder ────────────────────────────────────────────────────────────
 
 
+async def _safe_analytics_call(fn: Any, session: AsyncSession, symbol: str) -> Any:
+    try:
+        return await fn(session, symbol)
+    except Exception as exc:
+        logger.warning(
+            "Market explainer analytics call failed",
+            symbol=symbol,
+            fn=getattr(fn, "__name__", "unknown"),
+            error=str(exc),
+        )
+        return {}
+
+
 async def _build_context(session: AsyncSession, symbol: str) -> dict[str, Any]:
-    pcr_task = compute_pcr(session, symbol)
-    sr_task = compute_support_resistance(session, symbol)
-    gw_task = compute_gamma_walls(session, symbol)
-    mp_task = compute_max_pain(session, symbol)
-    flow_task = detect_options_flow(session, symbol)
-    ps_task = detect_positioning_shifts(session, symbol)
-    lt_task = detect_liquidity_traps(session, symbol)
-
-    import asyncio
-    results = await asyncio.gather(
-        pcr_task, sr_task, gw_task, mp_task, flow_task, ps_task, lt_task,
-        return_exceptions=True,
-    )
-
-    def safe(r: Any) -> Any:
-        return r if not isinstance(r, Exception) else {}
-
     return {
         "symbol": symbol,
-        "pcr": safe(results[0]),
-        "support_resistance": safe(results[1]),
-        "gamma_walls": safe(results[2]),
-        "max_pain": safe(results[3]),
-        "options_flow": safe(results[4]),
-        "positioning_shift": safe(results[5]),
-        "liquidity_traps": safe(results[6]),
+        "pcr": await _safe_analytics_call(compute_pcr, session, symbol),
+        "support_resistance": await _safe_analytics_call(compute_support_resistance, session, symbol),
+        "gamma_walls": await _safe_analytics_call(compute_gamma_walls, session, symbol),
+        "max_pain": await _safe_analytics_call(compute_max_pain, session, symbol),
+        "options_flow": await _safe_analytics_call(detect_options_flow, session, symbol),
+        "positioning_shift": await _safe_analytics_call(detect_positioning_shifts, session, symbol),
+        "liquidity_traps": await _safe_analytics_call(detect_liquidity_traps, session, symbol),
     }
 
 
@@ -133,7 +223,7 @@ async def _call_openai(prompt: str) -> str:
     response = await client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=300,
+        max_tokens=180,
         temperature=0.4,
     )
     return response.choices[0].message.content.strip()
@@ -145,7 +235,7 @@ async def _call_anthropic(prompt: str) -> str:
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
     message = await client.messages.create(
         model="claude-3-5-sonnet-20241022",
-        max_tokens=300,
+        max_tokens=180,
         messages=[{"role": "user", "content": prompt}],
     )
     return message.content[0].text.strip()
@@ -174,7 +264,7 @@ async def _call_bedrock(prompt: str) -> str:
         return client.converse(
             modelId=settings.bedrock_model_id,
             messages=messages,
-            inferenceConfig={"maxTokens": 300, "temperature": 0.4},
+            inferenceConfig={"maxTokens": 180, "temperature": 0.3},
         )
 
     loop = asyncio.get_event_loop()
@@ -212,32 +302,136 @@ async def _generate_insight(prompt: str) -> str:
     return "AI insight temporarily unavailable."
 
 
+async def refresh_market_summary_cache(session: AsyncSession, symbol: str) -> dict[str, Any]:
+    ctx = await _build_context(session, symbol)
+    prompt = _format_prompt(ctx)
+    insight = await _generate_insight(prompt)
+    await _persist_market_summary(session, symbol, insight)
+    _set_cache(symbol, insight)
+    payload = _summary_payload(
+        symbol,
+        insight,
+        cached=False,
+        generated_at=datetime.now(timezone.utc),
+    )
+    await _cache_market_summary_payload(symbol, payload)
+    return payload
+
+
+async def get_market_summary_payload(
+    session: AsyncSession,
+    symbol: str,
+    *,
+    allow_stale: bool,
+    refresh_if_missing: bool,
+) -> dict[str, Any]:
+    shared = await runtime_cache.get_json(_market_summary_cache_key(symbol))
+    if isinstance(shared, dict) and shared.get("insight"):
+        return shared
+
+    db_cached = await get_cached_market_summary_row(session, symbol)
+    if db_cached is not None:
+        payload = _summary_payload(
+            symbol,
+            db_cached.insight,
+            cached=True,
+            generated_at=db_cached.generated_at,
+        )
+        _set_cache(symbol, db_cached.insight)
+        await _cache_market_summary_payload(symbol, payload)
+        return payload
+
+    latest = await get_latest_market_summary_row(session, symbol)
+    if allow_stale and latest is not None:
+        payload = _summary_payload(
+            symbol,
+            latest.insight,
+            cached=True,
+            generated_at=latest.generated_at,
+            stale=True,
+        )
+        _set_cache(symbol, latest.insight)
+        await _cache_market_summary_payload(symbol, payload)
+        return payload
+
+    cached = _get_cached(symbol)
+    if cached:
+        payload = _summary_payload(symbol, cached, cached=True)
+        await _cache_market_summary_payload(symbol, payload)
+        return payload
+
+    if should_refresh_intraday_caches():
+        if not _has_ai_credentials():
+            return {
+                "symbol": symbol,
+                "insight": "AI market explanation requires API credentials (OpenAI, Anthropic, or AWS Bedrock).",
+                "cached": False,
+                "pending": False,
+                "generated_at": None,
+            }
+        import asyncio
+
+        if refresh_if_missing:
+            asyncio.create_task(trigger_market_summary_refresh(symbol))
+        return {
+            "symbol": symbol,
+            "insight": "Generating cached market insight...",
+            "cached": False,
+            "pending": True,
+            "generated_at": None,
+        }
+
+    return {
+        "symbol": symbol,
+        "insight": "No cached market insight available.",
+        "cached": False,
+        "pending": False,
+        "generated_at": None,
+    }
+
+
+async def warm_market_summary_shared_cache() -> None:
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        for symbol in settings.supported_symbols:
+            row = await get_latest_market_summary_row(session, symbol)
+            if row is None:
+                continue
+            payload = _summary_payload(
+                symbol,
+                row.insight,
+                cached=True,
+                generated_at=row.generated_at,
+                stale=(not should_refresh_intraday_caches(now)),
+            )
+            _set_cache(symbol, row.insight)
+            await _cache_market_summary_payload(symbol, payload, now)
+
+
+async def trigger_market_summary_refresh(symbol: str) -> None:
+    if not _has_ai_credentials() or symbol in _refresh_inflight or not should_refresh_intraday_caches():
+        return
+
+    _refresh_inflight.add(symbol)
+    async with AsyncSessionLocal() as session:
+        try:
+            await refresh_market_summary_cache(session, symbol)
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            logger.warning("Background market summary refresh failed", symbol=symbol, error=str(exc))
+        finally:
+            _refresh_inflight.discard(symbol)
+
+
 # ─── Public interface ──────────────────────────────────────────────────────────
 
 async def explain_market(session: AsyncSession, symbol: str) -> dict[str, Any]:
     """Return cached or freshly generated AI market insight for `symbol`."""
-    cached = _get_cached(symbol)
-    if cached:
-        return {"symbol": symbol, "insight": cached, "cached": True}
-
-    has_credentials = (
-        settings.openai_api_key
-        or settings.anthropic_api_key
-        or (settings.ai_provider == "bedrock" and settings.aws_access_key_id)
+    market_open = should_refresh_intraday_caches()
+    return await get_market_summary_payload(
+        session,
+        symbol,
+        allow_stale=not market_open,
+        refresh_if_missing=market_open,
     )
-    if not has_credentials:
-        return {
-            "symbol": symbol,
-            "insight": "AI market explanation requires API credentials (OpenAI, Anthropic, or AWS Bedrock).",
-            "cached": False,
-        }
-
-    try:
-        ctx = await _build_context(session, symbol)
-        prompt = _format_prompt(ctx)
-        insight = await _generate_insight(prompt)
-        _set_cache(symbol, insight)
-        return {"symbol": symbol, "insight": insight, "cached": False}
-    except Exception as exc:
-        logger.error("Market explainer failed", symbol=symbol, error=str(exc))
-        return {"symbol": symbol, "insight": "Unable to generate market insight at this time.", "cached": False}

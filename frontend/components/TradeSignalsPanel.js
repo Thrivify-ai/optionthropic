@@ -63,30 +63,7 @@ const QUICK_META = {
   "Wait":   { label: "WAIT",   icon: "◆", color: "text-slate-400",   bg: "bg-slate-500/10",   border: "border-slate-500/20"   },
 };
 
-function SignalCard({ symbol, refreshTick }) {
-  const [data, setData]           = useState(null);
-  const [quickData, setQuickData] = useState(null);
-  const [loading, setLoading]     = useState(true);
-  const [error, setError]         = useState(null);
-
-  useEffect(() => {
-    if (!symbol) return;
-    const first = !data;
-    if (first) setLoading(true);
-    setError(null);
-    Promise.all([
-      analyticsApi.tradingSignal(symbol),
-      analyticsApi.quickSignal(symbol),
-    ])
-      .then(([sig, quick]) => {
-        setData(sig);
-        setQuickData(quick);
-      })
-      .catch(() => setError("Signal unavailable"))
-      .finally(() => { if (first) setLoading(false); });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, refreshTick]);
-
+function SignalCard({ symbol, data, quickData, loading, error }) {
   if (loading) {
     return (
       <div className="card animate-pulse min-h-[320px] flex flex-col gap-3 p-5 shadow-lg shadow-black/10">
@@ -290,10 +267,32 @@ function SignalCard({ symbol, refreshTick }) {
 }
 
 export default function TradeSignalsPanel({ refreshTick }) {
+  const [overview, setOverview] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const first = Object.keys(overview).length === 0;
+    if (first) setLoading(true);
+    setError(null);
+    analyticsApi.dashboardOverview()
+      .then((data) => setOverview(data?.symbols || {}))
+      .catch(() => setError("Signal unavailable"))
+      .finally(() => { if (first) setLoading(false); });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshTick]);
+
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
       {SYMBOLS.map((s) => (
-        <SignalCard key={s} symbol={s} refreshTick={refreshTick} />
+        <SignalCard
+          key={s}
+          symbol={s}
+          data={overview[s]?.trading_signal}
+          quickData={overview[s]?.quick_signal}
+          loading={loading}
+          error={error}
+        />
       ))}
     </div>
   );

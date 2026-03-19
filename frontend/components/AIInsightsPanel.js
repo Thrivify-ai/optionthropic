@@ -14,10 +14,7 @@ const SYMBOL_META = {
   SENSEX:    { label: "BSE SENSEX",  color: "text-orange-400",  border: "border-orange-500/30",  bg: "from-orange-900/20"    },
 };
 
-function InsightCard({ symbol, onDataLoaded, refreshTick, deferMs = 0 }) {
-  const [data, setData]    = useState(null);
-  const [loading, setLoad] = useState(true);
-  const [error, setError]  = useState(null);
+function InsightCard({ symbol, data, loading, error, deferMs = 0 }) {
   const [ready, setReady]  = useState(!deferMs);
   const meta = SYMBOL_META[symbol] || SYMBOL_META.NIFTY;
 
@@ -30,17 +27,14 @@ function InsightCard({ symbol, onDataLoaded, refreshTick, deferMs = 0 }) {
     }
   }, [deferMs]);
 
-  useEffect(() => {
-    if (!symbol || !ready) return;
-    const firstLoad = !data;
-    if (firstLoad) setLoad(true);
-    setError(null);
-    analyticsApi
-      .marketSummary(symbol)
-      .then((d) => { setData(d); onDataLoaded?.(); })
-      .catch(() => setError("AI insight unavailable"))
-      .finally(() => { if (firstLoad) setLoad(false); });
-  }, [symbol, onDataLoaded, refreshTick, ready]);
+  if (!ready) {
+    return (
+      <div className={clsx(
+        "card border bg-gradient-to-br to-surface-card min-h-[180px] animate-pulse shadow-lg shadow-black/20",
+        meta.border, meta.bg
+      )} />
+    );
+  }
 
   return (
     <div className={clsx(
@@ -87,14 +81,45 @@ function InsightCard({ symbol, onDataLoaded, refreshTick, deferMs = 0 }) {
 }
 
 export default function AIInsightsPanel({ onDataLoaded, refreshTick }) {
+  const [overview, setOverview] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const first = Object.keys(overview).length === 0;
+    let retryTimer = null;
+    if (first) setLoading(true);
+    setError(null);
+    analyticsApi.dashboardOverview()
+      .then((data) => {
+        const symbols = data?.symbols || {};
+        setOverview(symbols);
+        onDataLoaded?.();
+        if (Object.values(symbols).some((entry) => entry?.ai_summary?.pending)) {
+          retryTimer = setTimeout(() => {
+            analyticsApi.dashboardOverview().then((nextData) => {
+              setOverview(nextData?.symbols || {});
+            }).catch(() => {});
+          }, 8000);
+        }
+      })
+      .catch(() => setError("AI insight unavailable"))
+      .finally(() => { if (first) setLoading(false); });
+    return () => {
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshTick]);
+
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
       {SYMBOLS.map((s, i) => (
         <InsightCard
           key={s}
           symbol={s}
-          onDataLoaded={onDataLoaded}
-          refreshTick={refreshTick}
+          data={overview[s]?.ai_summary}
+          loading={loading}
+          error={error}
           deferMs={i * 500}
         />
       ))}

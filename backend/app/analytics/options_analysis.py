@@ -11,6 +11,7 @@ import pandas as pd
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.foundation_utils import pcr_sentiment_from_value
 from app.models.chain_snapshot import ChainSnapshot
 from app.logging_config import get_logger
 
@@ -24,9 +25,17 @@ async def compute_pcr(
     session: AsyncSession, symbol: str, lookback_snapshots: int = 5
 ) -> dict[str, Any]:
     """
-    Returns PCR (OI-based), PCR (volume-based), and a 5-period rolling average.
+    Returns PCR for the latest snapshot and a recent rolling average.
     """
-    stmt = (
+    latest_ts_stmt = (
+        select(func.max(ChainSnapshot.timestamp))
+        .where(ChainSnapshot.symbol == symbol)
+    )
+    latest_ts = (await session.execute(latest_ts_stmt)).scalar()
+    if not latest_ts:
+        return {"pcr_oi": None, "pcr_volume": None, "sentiment": "NEUTRAL"}
+
+    latest_stmt = (
         select(
             ChainSnapshot.strike,
             func.sum(ChainSnapshot.call_oi).label("total_call_oi"),
@@ -34,12 +43,15 @@ async def compute_pcr(
             func.sum(ChainSnapshot.call_volume).label("total_call_vol"),
             func.sum(ChainSnapshot.put_volume).label("total_put_vol"),
         )
-        .where(ChainSnapshot.symbol == symbol)
+        .where(
+            ChainSnapshot.symbol == symbol,
+            ChainSnapshot.timestamp == latest_ts,
+        )
         .group_by(ChainSnapshot.strike)
         .order_by(ChainSnapshot.strike)
     )
 
-    rows = (await session.execute(stmt)).all()
+    rows = (await session.execute(latest_stmt)).all()
     if not rows:
         return {"pcr_oi": None, "pcr_volume": None, "sentiment": "NEUTRAL"}
 
@@ -52,20 +64,47 @@ async def compute_pcr(
     pcr_oi = round(total_put_oi / total_call_oi, 4) if total_call_oi else None
     pcr_vol = round(total_put_vol / total_call_vol, 4) if total_call_vol else None
 
-    sentiment = "NEUTRAL"
-    if pcr_oi is not None:
-        if pcr_oi > 1.3:
-            sentiment = "BULLISH"
-        elif pcr_oi < 0.7:
-            sentiment = "BEARISH"
+    rolling_timestamps_stmt = (
+        select(ChainSnapshot.timestamp)
+        .where(ChainSnapshot.symbol == symbol)
+        .distinct()
+        .order_by(ChainSnapshot.timestamp.desc())
+        .limit(max(1, lookback_snapshots))
+    )
+    timestamps = list((await session.execute(rolling_timestamps_stmt)).scalars().all())
+
+    pcr_history: list[float] = []
+    if timestamps:
+        rolling_stmt = (
+            select(
+                ChainSnapshot.timestamp,
+                func.sum(ChainSnapshot.call_oi).label("total_call_oi"),
+                func.sum(ChainSnapshot.put_oi).label("total_put_oi"),
+            )
+            .where(
+                ChainSnapshot.symbol == symbol,
+                ChainSnapshot.timestamp.in_(timestamps),
+            )
+            .group_by(ChainSnapshot.timestamp)
+            .order_by(ChainSnapshot.timestamp.desc())
+        )
+        rolling_rows = (await session.execute(rolling_stmt)).all()
+        for _, call_oi_sum, put_oi_sum in rolling_rows:
+            if call_oi_sum:
+                pcr_history.append(float(put_oi_sum or 0) / float(call_oi_sum))
+
+    pcr_oi_ma = round(sum(pcr_history) / len(pcr_history), 4) if pcr_history else None
+    sentiment = pcr_sentiment_from_value(pcr_oi)
 
     return {
         "symbol": symbol,
         "pcr_oi": pcr_oi,
         "pcr_volume": pcr_vol,
+        "pcr_oi_ma": pcr_oi_ma,
         "total_call_oi": int(total_call_oi),
         "total_put_oi": int(total_put_oi),
         "sentiment": sentiment,
+        "latest_snapshot_at": latest_ts.isoformat() if hasattr(latest_ts, "isoformat") else latest_ts,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

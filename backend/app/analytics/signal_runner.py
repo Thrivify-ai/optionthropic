@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.main_signal_logic import FeatureView, generate_main_signal_from_features
 from app.analytics.gamma_detection import compute_gamma_walls
 from app.analytics.max_pain_detection import compute_max_pain
 from app.analytics.options_analysis import compute_pcr
@@ -25,9 +26,51 @@ from app.config import settings
 from app.db.database import AsyncSessionLocal
 from app.logging_config import get_logger
 from app.models.chain_snapshot import ChainSnapshot
+from app.models.signal_feature_snapshot import SignalFeatureSnapshot
 from app.models.trading_signal import TradingSignalRow
 
 logger = get_logger(__name__)
+
+
+async def _latest_feature_views(
+    session: AsyncSession,
+    symbol: str,
+    timeframe: str,
+    limit: int = 2,
+) -> list[FeatureView]:
+    rows = (
+        await session.execute(
+            select(SignalFeatureSnapshot)
+            .where(
+                SignalFeatureSnapshot.symbol == symbol,
+                SignalFeatureSnapshot.timeframe == timeframe,
+            )
+            .order_by(SignalFeatureSnapshot.snapshot_timestamp.desc(), SignalFeatureSnapshot.id.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return [
+        FeatureView(
+            timeframe=row.timeframe,
+            current_price=float(row.current_price),
+            prev_price=float(row.prev_price),
+            pcr_oi=float(row.pcr_oi) if row.pcr_oi is not None else None,
+            support_strike=float(row.support_strike) if row.support_strike is not None else None,
+            resistance_strike=float(row.resistance_strike) if row.resistance_strike is not None else None,
+            near_support_put_oi_change=int(row.near_support_put_oi_change),
+            near_resistance_call_oi_change=int(row.near_resistance_call_oi_change),
+            writer_bullish_score=int(row.writer_bullish_score),
+            writer_bearish_score=int(row.writer_bearish_score),
+            position_buildup=row.position_buildup,
+            volume_spike=bool(row.volume_spike),
+            price_rangebound=bool(row.price_rangebound),
+            rangebound_oi_both_sides=bool(row.rangebound_oi_both_sides),
+            breakout_flag=bool(row.breakout_flag),
+            breakdown_flag=bool(row.breakdown_flag),
+            trap_warning_flag=bool(row.trap_warning_flag),
+        )
+        for row in rows
+    ]
 
 
 # ─── Sentiment scoring (mirrors frontend deriveAll) ───────────────────────────
@@ -355,7 +398,21 @@ async def run_signal_engine_cycle() -> None:
                 snap30 = await _price_snapshot(session, symbol, 30)
                 snap60 = await _price_snapshot(session, symbol, 60)
 
-                ts = _make_signal(symbol, sentiment, snap5, snap30, snap60)
+                f5_views = await _latest_feature_views(session, symbol, "5m", limit=2)
+                f30_views = await _latest_feature_views(session, symbol, "30m", limit=2)
+                f60_views = await _latest_feature_views(session, symbol, "60m", limit=2)
+
+                if f5_views and f30_views and f60_views:
+                    previous_views = None
+                    if len(f5_views) > 1 and len(f30_views) > 1 and len(f60_views) > 1:
+                        previous_views = (f5_views[1], f30_views[1], f60_views[1])
+                    ts = generate_main_signal_from_features(
+                        symbol,
+                        (f5_views[0], f30_views[0], f60_views[0]),
+                        previous_views,
+                    )
+                else:
+                    ts = _make_signal(symbol, sentiment, snap5, snap30, snap60)
 
                 row = TradingSignalRow(
                     symbol=symbol,
