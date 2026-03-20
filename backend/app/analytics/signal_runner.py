@@ -25,6 +25,13 @@ from app.analytics.gamma_detection import compute_gamma_walls
 from app.analytics.max_pain_detection import compute_max_pain
 from app.analytics.options_analysis import compute_pcr
 from app.analytics.options_flow_detection import detect_options_flow
+from app.analytics.quant_signal_capture import (
+    build_quant_context,
+    derive_shadow_signal,
+    record_quant_signal_candidate,
+    record_shadow_decision,
+    refresh_pending_quant_signal_outcomes,
+)
 from app.analytics.signal_outcomes import (
     record_signal_outcome_candidate,
     refresh_pending_signal_outcomes,
@@ -453,21 +460,122 @@ async def run_signal_engine_cycle() -> None:
                     ts.bias_60m.value,
                     int(ts.confidence),
                 )
+                generated_at = datetime.now(timezone.utc)
+                entry_price = None
+                if f5_views:
+                    entry_price = float(f5_views[0].current_price)
+                elif snap5:
+                    entry_price = float(snap5["current_price"])
+                elif snap30:
+                    entry_price = float(snap30["current_price"])
+                elif sentiment.get("spot"):
+                    entry_price = float(sentiment["spot"])
+
+                breakout = False
+                breakdown = False
+                trap_detected = False
+                rangebound = False
+                five_min_change_points = None
+                call_oi_delta = None
+                put_oi_delta = None
+                writer_support = False
+                previous_support = None
+                previous_resistance = None
+                if f5_views and f30_views and f60_views:
+                    current_f5 = f5_views[0]
+                    current_f30 = f30_views[0]
+                    current_f60 = f60_views[0]
+                    breakout = bool(current_f5.breakout_flag or current_f30.breakout_flag)
+                    breakdown = bool(current_f5.breakdown_flag or current_f30.breakdown_flag)
+                    trap_detected = bool(
+                        current_f5.trap_warning_flag
+                        or current_f30.trap_warning_flag
+                        or current_f60.trap_warning_flag
+                    )
+                    rangebound = bool(
+                        current_f30.price_rangebound
+                        and current_f60.price_rangebound
+                    )
+                    five_min_change_points = round(current_f5.current_price - current_f5.prev_price, 2)
+                    call_oi_delta = float(current_f5.near_resistance_call_oi_change)
+                    put_oi_delta = float(current_f5.near_support_put_oi_change)
+                    if ts.signal.value == "Buy CE":
+                        writer_support = bool(current_f30.writer_bullish_score or current_f60.writer_bullish_score)
+                    elif ts.signal.value == "Buy PE":
+                        writer_support = bool(current_f30.writer_bearish_score or current_f60.writer_bearish_score)
+                    if len(f30_views) > 1:
+                        previous_support = f30_views[1].support_strike
+                        previous_resistance = f30_views[1].resistance_strike
+                    elif len(f60_views) > 1:
+                        previous_support = f60_views[1].support_strike
+                        previous_resistance = f60_views[1].resistance_strike
+
+                quant_context = await build_quant_context(
+                    session,
+                    symbol=symbol,
+                    engine="MAIN",
+                    signal=ts.signal.value,
+                    entry_time=generated_at,
+                    current_price=entry_price,
+                    support=ts.support,
+                    resistance=ts.resistance,
+                    five_min_change_points=five_min_change_points,
+                    breakout=breakout,
+                    breakdown=breakdown,
+                    trap_detected=trap_detected,
+                    rangebound=rangebound,
+                    call_oi_delta=call_oi_delta,
+                    put_oi_delta=put_oi_delta,
+                    volume_spike=bool(f5_views and f5_views[0].volume_spike),
+                    writer_support=writer_support,
+                    outlook=str(context["outlook"]),
+                    state=str(context["state"]),
+                    entry_ready=bool(context["entry_ready"]),
+                    previous_support=previous_support,
+                    previous_resistance=previous_resistance,
+                )
+                await record_shadow_decision(
+                    session,
+                    engine="MAIN",
+                    signal_version="main_v2_live",
+                    mode="LIVE",
+                    symbol=symbol,
+                    signal=ts.signal.value,
+                    confidence=int(ts.confidence),
+                    generated_at=generated_at,
+                    reason=ts.reason,
+                    context=quant_context,
+                    outlook=str(context["outlook"]),
+                    state=str(context["state"]),
+                    entry_ready=bool(context["entry_ready"]),
+                )
+                shadow_signal, shadow_confidence, shadow_reason = derive_shadow_signal(
+                    engine="MAIN",
+                    signal=ts.signal.value,
+                    confidence=int(ts.confidence),
+                    context=quant_context,
+                    entry_ready=bool(context["entry_ready"]),
+                )
+                await record_shadow_decision(
+                    session,
+                    engine="MAIN",
+                    signal_version="main_v3_shadow",
+                    mode="SHADOW",
+                    symbol=symbol,
+                    signal=shadow_signal,
+                    confidence=shadow_confidence,
+                    generated_at=generated_at,
+                    reason=shadow_reason,
+                    context=quant_context,
+                    outlook=str(context["outlook"]),
+                    state=str(context["state"]),
+                    entry_ready=shadow_signal in ("Buy CE", "Buy PE"),
+                )
                 signal_changed = (
                     latest_existing is None
                     or latest_existing.signal != ts.signal.value
                 )
                 if ts.signal.value in ("Buy CE", "Buy PE") and signal_changed:
-                    entry_price = None
-                    if f5_views:
-                        entry_price = float(f5_views[0].current_price)
-                    elif snap5:
-                        entry_price = float(snap5["current_price"])
-                    elif snap30:
-                        entry_price = float(snap30["current_price"])
-                    elif sentiment.get("spot"):
-                        entry_price = float(sentiment["spot"])
-
                     if entry_price is not None and entry_price > 0:
                         await record_signal_outcome_candidate(
                             session,
@@ -476,11 +584,43 @@ async def run_signal_engine_cycle() -> None:
                             signal=ts.signal.value,
                             confidence=int(ts.confidence),
                             entry_price=entry_price,
-                            entry_time=datetime.now(timezone.utc),
+                            entry_time=generated_at,
                             reason=ts.reason,
                             outlook=str(context["outlook"]),
                             state=str(context["state"]),
                         )
+                        await record_quant_signal_candidate(
+                            session,
+                            engine="MAIN",
+                            signal_version="main_v2_live",
+                            symbol=symbol,
+                            signal=ts.signal.value,
+                            confidence=int(ts.confidence),
+                            entry_time=generated_at,
+                            underlying_entry_price=entry_price,
+                            reason=ts.reason,
+                            context=quant_context,
+                            outlook=str(context["outlook"]),
+                            state=str(context["state"]),
+                            entry_ready=bool(context["entry_ready"]),
+                        )
+
+                if shadow_signal in ("Buy CE", "Buy PE") and entry_price is not None and entry_price > 0:
+                    await record_quant_signal_candidate(
+                        session,
+                        engine="MAIN",
+                        signal_version="main_v3_shadow",
+                        symbol=symbol,
+                        signal=shadow_signal,
+                        confidence=shadow_confidence,
+                        entry_time=generated_at,
+                        underlying_entry_price=entry_price,
+                        reason=shadow_reason,
+                        context=quant_context,
+                        outlook=str(context["outlook"]),
+                        state=str(context["state"]),
+                        entry_ready=True,
+                    )
 
                 logger.info(
                     "signal_generated",
@@ -497,4 +637,5 @@ async def run_signal_engine_cycle() -> None:
                                symbol=symbol, error=str(exc))
 
         await refresh_pending_signal_outcomes(session)
+        await refresh_pending_quant_signal_outcomes(session)
         await session.commit()

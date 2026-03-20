@@ -37,6 +37,7 @@ from app.analytics.quick_signal_utils import (
 )
 from app.logging_config import get_logger
 from app.models.chain_snapshot import ChainSnapshot
+from app.models.underlying_bar import UnderlyingBar
 from app.services.runtime_cache import runtime_cache
 
 logger = get_logger(__name__)
@@ -117,6 +118,8 @@ def _wait_payload(
     risk_reward_reason: str = "No trade direction",
     trap_detected: bool = False,
     rangebound: bool = False,
+    call_oi_delta: Optional[float] = None,
+    put_oi_delta: Optional[float] = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "symbol": symbol,
@@ -140,6 +143,10 @@ def _wait_payload(
     }
     if current_price is not None:
         payload["current_price"] = round(current_price, 2)
+    if call_oi_delta is not None:
+        payload["call_oi_delta"] = round(call_oi_delta, 2)
+    if put_oi_delta is not None:
+        payload["put_oi_delta"] = round(put_oi_delta, 2)
     return payload
 
 
@@ -279,6 +286,24 @@ async def _support_resistance(
     return support, resistance
 
 
+async def _recent_underlying_bars(
+    session: AsyncSession,
+    symbol: str,
+    limit: int = 4,
+) -> list[UnderlyingBar]:
+    return (
+        await session.execute(
+            select(UnderlyingBar)
+            .where(
+                UnderlyingBar.symbol == symbol,
+                UnderlyingBar.timeframe == "1m",
+            )
+            .order_by(UnderlyingBar.bar_time.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+
+
 def _target_move(cfg: dict[str, float]) -> int:
     return int(cfg.get("target_move", 40))
 
@@ -304,6 +329,8 @@ def _signal_payload(
     trap_detected: bool,
     rangebound: bool,
     reason: str,
+    call_oi_delta: float,
+    put_oi_delta: float,
 ) -> dict[str, Any]:
     return {
         "symbol": symbol,
@@ -324,6 +351,8 @@ def _signal_payload(
         "risk_reward_reason": risk_reward_reason,
         "trap_detected": bool(trap_detected),
         "rangebound": bool(rangebound),
+        "call_oi_delta": round(call_oi_delta, 2),
+        "put_oi_delta": round(put_oi_delta, 2),
         "reason": reason,
         "timestamp": _timestamp_now(now_utc),
     }
@@ -427,8 +456,28 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         cfg["band_pct"],
     )
 
+    bar_rows = await _recent_underlying_bars(session, symbol, limit=4)
     momentum_1m = round(spot - prev_1m["price"], 2)
+    momentum_3m = None
+    momentum_prev_leg = None
     pct_1m = (momentum_1m / prev_1m["price"] * 100) if prev_1m["price"] else 0.0
+
+    if len(bar_rows) >= 2:
+        latest_bar = bar_rows[0]
+        prior_bar = bar_rows[1]
+        latest_close = float(latest_bar.close)
+        prior_close = float(prior_bar.close)
+        momentum_1m = round(latest_close - prior_close, 2)
+        pct_1m = (momentum_1m / prior_close * 100) if prior_close else pct_1m
+        if len(bar_rows) >= 4:
+            third_bar = bar_rows[3]
+            momentum_3m = round(latest_close - float(third_bar.close), 2)
+            momentum_prev_leg = round(prior_close - float(third_bar.close), 2)
+        elif ts_3m is not None:
+            prev_3m = await _snap(session, symbol, ts_3m)
+            if prev_3m and prev_3m["price"]:
+                momentum_3m = round(latest_close - prev_3m["price"], 2)
+                momentum_prev_leg = round(prior_close - prev_3m["price"], 2)
     soft_bull = momentum_1m >= bull_mom * soft_ratio or pct_1m >= pct_min
     soft_bear = momentum_1m <= bear_mom * soft_ratio or pct_1m <= -pct_min
     strong_bullish = momentum_1m >= bull_mom or (pct_1m >= pct_min and momentum_1m > 0)
@@ -468,9 +517,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         and spot > prev_1m["price"]
     )
 
-    momentum_3m = None
-    momentum_prev_leg = None
-    if ts_3m is not None:
+    if momentum_3m is None and ts_3m is not None:
         prev_3m = await _snap(session, symbol, ts_3m)
         if prev_3m and prev_3m["price"]:
             momentum_3m = round(spot - prev_3m["price"], 2)
@@ -614,6 +661,8 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             trap_detected=trap_bull,
             rangebound=rangebound,
             reason=reason,
+            call_oi_delta=call_oi_delta,
+            put_oi_delta=put_oi_delta,
         )
         return await _finalize_payload(
             symbol,
@@ -657,6 +706,8 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             trap_detected=trap_bear,
             rangebound=rangebound,
             reason=reason,
+            call_oi_delta=call_oi_delta,
+            put_oi_delta=put_oi_delta,
         )
         return await _finalize_payload(
             symbol,
@@ -687,6 +738,8 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             risk_reward_reason="Conflicting direction",
             trap_detected=hard_invalidation,
             rangebound=rangebound,
+            call_oi_delta=call_oi_delta,
+            put_oi_delta=put_oi_delta,
         )
         return await _finalize_payload(
             symbol,
@@ -757,6 +810,8 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         risk_reward_reason=rr_reason,
         trap_detected=hard_invalidation,
         rangebound=rangebound,
+        call_oi_delta=call_oi_delta,
+        put_oi_delta=put_oi_delta,
     )
     return await _finalize_payload(
         symbol,

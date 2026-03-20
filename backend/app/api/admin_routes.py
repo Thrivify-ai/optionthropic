@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.quant_signal_capture import build_quant_signal_analytics_payload
 from app.analytics.signal_outcomes import build_signal_analytics_payload
 from app.api.auth_routes import require_admin
 from app.config import settings
@@ -173,4 +174,8 @@ async def signal_analytics(
     days: int = 7,
     limit: int = 200,
 ) -> Any:
-    return await build_signal_analytics_payload(session, days=days, limit=limit)
+    legacy = await build_signal_analytics_payload(session, days=days, limit=limit)
+    quant = await build_quant_signal_analytics_payload(session, days=days, limit=max(limit, 300))
+    payload = dict(legacy)
+    payload.update(quant)
+    return payload

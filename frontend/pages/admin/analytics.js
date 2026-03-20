@@ -16,6 +16,7 @@ function MoveCell({ move, outcomeForMove }) {
 }
 
 function CalibrationTable({ title, rows }) {
+  const showVersion = rows?.some((row) => row.signal_version);
   return (
     <div className="card overflow-hidden">
       <p className="text-sm font-semibold text-slate-200 p-4 border-b border-surface-border">
@@ -25,6 +26,7 @@ function CalibrationTable({ title, rows }) {
         <table className="w-full text-left">
           <thead className="bg-surface-card border-b border-surface-border">
             <tr className="text-[10px] uppercase tracking-wider text-slate-500">
+              {showVersion && <th className="p-3">Version</th>}
               <th className="p-3">Confidence</th>
               <th className="p-3">Total</th>
               <th className="p-3">Won</th>
@@ -35,16 +37,91 @@ function CalibrationTable({ title, rows }) {
           </thead>
           <tbody>
             {!rows?.length && (
-              <tr><td colSpan={6} className="p-6 text-center text-slate-500">No calibration data yet</td></tr>
+              <tr><td colSpan={showVersion ? 7 : 6} className="p-6 text-center text-slate-500">No calibration data yet</td></tr>
             )}
             {rows?.map((row) => (
-              <tr key={`${title}-${row.bucket}`} className="border-b border-surface-border/50 hover:bg-white/5">
+              <tr key={`${title}-${row.signal_version ?? "legacy"}-${row.bucket}`} className="border-b border-surface-border/50 hover:bg-white/5">
+                {showVersion && <td className="p-3 font-mono text-slate-300">{row.signal_version ?? "legacy"}</td>}
                 <td className="p-3 font-mono text-slate-200">{row.bucket}</td>
                 <td className="p-3">{row.total}</td>
                 <td className="p-3 text-emerald-400">{row.won}</td>
                 <td className="p-3 text-red-400">{row.lost}</td>
                 <td className="p-3 text-slate-400">{row.unknown}</td>
                 <td className="p-3 font-mono text-slate-200">{row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function SegmentTable({ title, rows }) {
+  return (
+    <div className="card overflow-hidden">
+      <p className="text-sm font-semibold text-slate-200 p-4 border-b border-surface-border">
+        {title}
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left">
+          <thead className="bg-surface-card border-b border-surface-border">
+            <tr className="text-[10px] uppercase tracking-wider text-slate-500">
+              <th className="p-3">Segment</th>
+              <th className="p-3">Total</th>
+              <th className="p-3">Won</th>
+              <th className="p-3">Lost</th>
+              <th className="p-3">Unknown</th>
+              <th className="p-3">Win Rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!rows?.length && (
+              <tr><td colSpan={6} className="p-6 text-center text-slate-500">No segment data yet</td></tr>
+            )}
+            {rows?.map((row) => (
+              <tr key={`${title}-${row.value}`} className="border-b border-surface-border/50 hover:bg-white/5">
+                <td className="p-3 font-mono text-slate-200">{row.value}</td>
+                <td className="p-3">{row.total}</td>
+                <td className="p-3 text-emerald-400">{row.won}</td>
+                <td className="p-3 text-red-400">{row.lost}</td>
+                <td className="p-3 text-slate-400">{row.unknown}</td>
+                <td className="p-3 font-mono text-slate-200">{row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function DecisionMixTable({ title, rows }) {
+  return (
+    <div className="card overflow-hidden">
+      <p className="text-sm font-semibold text-slate-200 p-4 border-b border-surface-border">
+        {title}
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left">
+          <thead className="bg-surface-card border-b border-surface-border">
+            <tr className="text-[10px] uppercase tracking-wider text-slate-500">
+              <th className="p-3">Version</th>
+              <th className="p-3">Signal</th>
+              <th className="p-3">Total</th>
+              <th className="p-3">Avg Conf</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!rows?.length && (
+              <tr><td colSpan={4} className="p-6 text-center text-slate-500">No decision mix yet</td></tr>
+            )}
+            {rows?.map((row) => (
+              <tr key={`${title}-${row.signal_version}-${row.signal}`} className="border-b border-surface-border/50 hover:bg-white/5">
+                <td className="p-3 font-mono text-slate-200">{row.signal_version}</td>
+                <td className="p-3 font-semibold text-slate-200">{row.signal}</td>
+                <td className="p-3">{row.total}</td>
+                <td className="p-3 font-mono text-slate-200">{row.avg_confidence}</td>
               </tr>
             ))}
           </tbody>
@@ -226,6 +303,95 @@ export default function AdminAnalytics() {
 
             <CalibrationTable title="Quick Confidence Calibration" rows={data.quick_calibration} />
             <CalibrationTable title="Long Confidence Calibration" rows={data.long_calibration} />
+
+            <div className="card overflow-hidden">
+              <p className="text-sm font-semibold text-slate-200 p-4 border-b border-surface-border flex items-center gap-3">
+                Quant Outcomes (Option Economics)
+                <span className="text-xs font-normal text-slate-500">
+                  Quick {data.quick_quant_summary?.total ?? 0} total · Long {data.long_quant_summary?.total ?? 0} total
+                </span>
+              </p>
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-0 xl:divide-x divide-surface-border">
+                <div className="p-4 space-y-3">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Quick Option Premium Outcomes</p>
+                  <div className="overflow-x-auto max-h-[32vh] overflow-y-auto">
+                    <table className="w-full text-left">
+                      <thead className="sticky top-0 bg-surface-card border-b border-surface-border">
+                        <tr className="text-[10px] uppercase tracking-wider text-slate-500">
+                          <th className="p-2">Time</th>
+                          <th className="p-2">Version</th>
+                          <th className="p-2">Signal</th>
+                          <th className="p-2">Opt @Entry</th>
+                          <th className="p-2">2m</th>
+                          <th className="p-2">3m</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.quick_quant_signals?.slice(0, 40).map((row) => (
+                          <tr key={`quick-quant-${row.id}`} className="border-b border-surface-border/50 hover:bg-white/5">
+                            <td className="p-2 font-mono text-[11px] text-slate-400">{row.entry_time ? new Date(row.entry_time).toLocaleString("en-IN", { hour12: false }) : "—"}</td>
+                            <td className="p-2 font-mono text-[11px] text-slate-300">{row.signal_version}</td>
+                            <td className={clsx("p-2 font-bold", row.signal === "Buy CE" ? "text-emerald-400" : "text-red-400")}>{row.signal}</td>
+                            <td className="p-2 font-mono text-[11px]">{row.option_entry_ltp != null ? row.option_entry_ltp : "—"}</td>
+                            <td className="p-2 font-mono text-[11px]"><MoveCell move={row.option_move_2m} outcomeForMove={row.option_outcome_2m} /></td>
+                            <td className="p-2 font-mono text-[11px]"><MoveCell move={row.option_move_3m} outcomeForMove={row.option_outcome_3m} /></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div className="p-4 space-y-3">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Long Option Premium Outcomes</p>
+                  <div className="overflow-x-auto max-h-[32vh] overflow-y-auto">
+                    <table className="w-full text-left">
+                      <thead className="sticky top-0 bg-surface-card border-b border-surface-border">
+                        <tr className="text-[10px] uppercase tracking-wider text-slate-500">
+                          <th className="p-2">Time</th>
+                          <th className="p-2">Version</th>
+                          <th className="p-2">Signal</th>
+                          <th className="p-2">Opt @Entry</th>
+                          <th className="p-2">5m</th>
+                          <th className="p-2">10m</th>
+                          <th className="p-2">30m</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.long_quant_signals?.slice(0, 40).map((row) => (
+                          <tr key={`long-quant-${row.id}`} className="border-b border-surface-border/50 hover:bg-white/5">
+                            <td className="p-2 font-mono text-[11px] text-slate-400">{row.entry_time ? new Date(row.entry_time).toLocaleString("en-IN", { hour12: false }) : "—"}</td>
+                            <td className="p-2 font-mono text-[11px] text-slate-300">{row.signal_version}</td>
+                            <td className={clsx("p-2 font-bold", row.signal === "Buy CE" ? "text-emerald-400" : "text-red-400")}>{row.signal}</td>
+                            <td className="p-2 font-mono text-[11px]">{row.option_entry_ltp != null ? row.option_entry_ltp : "—"}</td>
+                            <td className="p-2 font-mono text-[11px]"><MoveCell move={row.option_move_5m} outcomeForMove={row.option_outcome_5m} /></td>
+                            <td className="p-2 font-mono text-[11px]"><MoveCell move={row.option_move_10m} outcomeForMove={row.option_outcome_10m} /></td>
+                            <td className="p-2 font-mono text-[11px]"><MoveCell move={row.option_move_30m} outcomeForMove={row.option_outcome_30m} /></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <CalibrationTable title="Quant Calibration By Version" rows={data.quant_calibration} />
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <SegmentTable title="Quick By Session" rows={data.quick_segments?.session_bucket} />
+              <SegmentTable title="Quick By Vol Regime" rows={data.quick_segments?.vol_regime} />
+              <SegmentTable title="Quick By Breakout Class" rows={data.quick_segments?.breakout_class} />
+              <SegmentTable title="Quick By Expiry Bucket" rows={data.quick_segments?.expiry_bucket} />
+              <SegmentTable title="Long By Session" rows={data.long_segments?.session_bucket} />
+              <SegmentTable title="Long By Vol Regime" rows={data.long_segments?.vol_regime} />
+              <SegmentTable title="Long By Breakout Class" rows={data.long_segments?.breakout_class} />
+              <SegmentTable title="Long By Expiry Bucket" rows={data.long_segments?.expiry_bucket} />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <DecisionMixTable title="Quick Live vs Shadow Mix" rows={data.quick_decision_mix} />
+              <DecisionMixTable title="Long Live vs Shadow Mix" rows={data.long_decision_mix} />
+            </div>
           </>
         )}
       </div>

@@ -265,6 +265,7 @@ export default function QuickSignalsCard() {
           reason: r.reason ?? null,
           confidence: r.confidence ?? 0,
           engine: "QUICK",
+          payload: r,
         });
         if (saved) {
           setHistory((h) => {

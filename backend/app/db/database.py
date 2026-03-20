@@ -54,6 +54,8 @@ async def create_all_tables() -> None:
         underlying_bar,
         signal_feature_snapshot,
         signal_outcome,
+        quant_signal_outcome,
+        signal_shadow_decision,
         dashboard_snapshot_cache,
         market_summary_cache,
     )
