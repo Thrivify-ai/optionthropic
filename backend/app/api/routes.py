@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai_engine.market_explainer import explain_market
 from app.alerts.alert_engine import run_alert_evaluation
 from app.analytics.dashboard_cache import get_dashboard_overview
+from app.analytics.dashboard_view_utils import serialize_trading_signal_payload
 from app.analytics.gamma_detection import compute_gamma_walls
 from app.analytics.liquidity_trap_detection import detect_liquidity_traps
 from app.analytics.max_pain_detection import compute_max_pain
@@ -231,29 +232,13 @@ async def get_trading_signal(
     )
     row = (await session.execute(stmt)).scalars().first()
     if not row:
-        return {
-            "symbol": symbol,
-            "signal": "Wait",
-            "confidence": 0,
-            "support": None,
-            "resistance": None,
-            "bias_5m": "Neutral",
-            "bias_30m": "Neutral",
-            "bias_60m": "Neutral",
-            "reason": "No signal generated yet.",
-        }
+        payload = serialize_trading_signal_payload(None)
+        payload["symbol"] = symbol
+        return payload
 
-    return {
-        "symbol": row.symbol,
-        "signal": row.signal,
-        "confidence": row.confidence,
-        "support": float(row.support) if row.support is not None else None,
-        "resistance": float(row.resistance) if row.resistance is not None else None,
-        "bias_5m": row.bias_5m,
-        "bias_30m": row.bias_30m,
-        "bias_60m": row.bias_60m,
-        "reason": row.reason,
-    }
+    payload = serialize_trading_signal_payload(row)
+    payload["symbol"] = row.symbol
+    return payload
 
 
 # ─── Live Ticks (tick-by-tick when WebSocket connected) ──────────────────────
@@ -457,6 +442,8 @@ class BuySignalCreate(_PydanticBase):
     level: float | None = None
     momentum: float | None = None
     reason: str | None = None
+    confidence: int | None = None
+    engine: str | None = "QUICK"
 
 
 @router.post("/buy-signal-history")
@@ -473,7 +460,8 @@ async def create_buy_signal(
         raise HTTPException(status_code=400, detail="signal must be Buy CE or Buy PE")
     symbol = _validate_symbol(body.symbol)
 
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=90)
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(seconds=90)
     dup = (
         select(BuySignalHistory)
         .where(
@@ -499,6 +487,23 @@ async def create_buy_signal(
     )
     session.add(row)
     await session.flush()
+
+    entry_price = float(body.level) if body.level is not None else None
+    if entry_price is not None:
+        from app.analytics.signal_outcomes import record_signal_outcome_candidate
+
+        await record_signal_outcome_candidate(
+            session,
+            engine=(body.engine or "QUICK"),
+            symbol=symbol,
+            signal=body.signal,
+            confidence=int(body.confidence or 0),
+            entry_price=entry_price,
+            entry_time=now_utc,
+            reason=body.reason,
+            state="active",
+        )
+
     return {"id": row.id, "symbol": symbol, "signal": body.signal, "created_at": row.created_at.isoformat()}
 
 

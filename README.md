@@ -172,6 +172,23 @@ Set `DATA_SOURCE` in `.env`:
 | `ZERODHA` | Zerodha Kite Connect (requires API key + access token) |
 | `ANGEL` | Angel One SmartAPI (requires client credentials + TOTP) |
 
+### Zerodha: refresh access token (semi-automatic)
+
+Kite still needs you to log in in the browser (password + 2FA). You can avoid copying `request_token` by hand:
+
+1. In the [Kite Connect app](https://developers.kite.trade/apps) set **Redirect URL** to **`http://127.0.0.1:8765/`** (or the same host/port you pass to the script).
+2. In `.env`: `ZERODHA_API_KEY`, `ZERODHA_API_SECRET` (used only to exchange the token).
+3. From the **repo root** on your machine (not inside Docker):
+
+   ```bash
+   pip install kiteconnect python-dotenv
+   python scripts/zerodha_login.py
+   ```
+
+4. Restart the backend: `docker compose restart backend`
+
+The script opens the login page, captures the redirect, writes `ZERODHA_ACCESS_TOKEN` to `.env`. Tokens expire daily — run again when `/api/zerodha-status` shows an invalid token.
+
 ---
 
 ## Authentication

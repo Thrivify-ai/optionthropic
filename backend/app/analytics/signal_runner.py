@@ -16,11 +16,19 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.analytics.main_signal_logic import FeatureView, generate_main_signal_from_features
+from app.analytics.main_signal_logic import (
+    FeatureView,
+    derive_signal_context,
+    generate_main_signal_from_features,
+)
 from app.analytics.gamma_detection import compute_gamma_walls
 from app.analytics.max_pain_detection import compute_max_pain
 from app.analytics.options_analysis import compute_pcr
 from app.analytics.options_flow_detection import detect_options_flow
+from app.analytics.signal_outcomes import (
+    record_signal_outcome_candidate,
+    refresh_pending_signal_outcomes,
+)
 from app.analytics.signal_engine import Bias, Signal, TradingSignal
 from app.config import settings
 from app.db.database import AsyncSessionLocal
@@ -54,6 +62,7 @@ async def _latest_feature_views(
             timeframe=row.timeframe,
             current_price=float(row.current_price),
             prev_price=float(row.prev_price),
+            price_change_pct=float(row.price_change_pct),
             pcr_oi=float(row.pcr_oi) if row.pcr_oi is not None else None,
             support_strike=float(row.support_strike) if row.support_strike is not None else None,
             resistance_strike=float(row.resistance_strike) if row.resistance_strike is not None else None,
@@ -68,6 +77,7 @@ async def _latest_feature_views(
             breakout_flag=bool(row.breakout_flag),
             breakdown_flag=bool(row.breakdown_flag),
             trap_warning_flag=bool(row.trap_warning_flag),
+            data_quality_score=int(row.data_quality_score),
         )
         for row in rows
     ]
@@ -414,6 +424,15 @@ async def run_signal_engine_cycle() -> None:
                 else:
                     ts = _make_signal(symbol, sentiment, snap5, snap30, snap60)
 
+                latest_existing = (
+                    await session.execute(
+                        select(TradingSignalRow)
+                        .where(TradingSignalRow.symbol == symbol)
+                        .order_by(TradingSignalRow.generated_at.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+
                 row = TradingSignalRow(
                     symbol=symbol,
                     signal=ts.signal.value,
@@ -426,6 +445,42 @@ async def run_signal_engine_cycle() -> None:
                     reason=ts.reason,
                 )
                 session.add(row)
+
+                context = derive_signal_context(
+                    ts.signal.value,
+                    ts.bias_5m.value,
+                    ts.bias_30m.value,
+                    ts.bias_60m.value,
+                    int(ts.confidence),
+                )
+                signal_changed = (
+                    latest_existing is None
+                    or latest_existing.signal != ts.signal.value
+                )
+                if ts.signal.value in ("Buy CE", "Buy PE") and signal_changed:
+                    entry_price = None
+                    if f5_views:
+                        entry_price = float(f5_views[0].current_price)
+                    elif snap5:
+                        entry_price = float(snap5["current_price"])
+                    elif snap30:
+                        entry_price = float(snap30["current_price"])
+                    elif sentiment.get("spot"):
+                        entry_price = float(sentiment["spot"])
+
+                    if entry_price is not None and entry_price > 0:
+                        await record_signal_outcome_candidate(
+                            session,
+                            engine="MAIN",
+                            symbol=symbol,
+                            signal=ts.signal.value,
+                            confidence=int(ts.confidence),
+                            entry_price=entry_price,
+                            entry_time=datetime.now(timezone.utc),
+                            reason=ts.reason,
+                            outlook=str(context["outlook"]),
+                            state=str(context["state"]),
+                        )
 
                 logger.info(
                     "signal_generated",
@@ -441,4 +496,5 @@ async def run_signal_engine_cycle() -> None:
                 logger.warning("signal_engine_cycle_failed",
                                symbol=symbol, error=str(exc))
 
+        await refresh_pending_signal_outcomes(session)
         await session.commit()

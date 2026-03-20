@@ -89,9 +89,17 @@ function SignalCard({ symbol, data, quickData, loading, error }) {
 
   const signal     = data?.signal     ?? "Wait";
   const confidence = Number(data?.confidence ?? 0);
+  const outlook    = data?.outlook ?? data?.bias_60m ?? "Neutral";
+  const state      = data?.state ?? (signal === "Wait" ? "idle" : "active");
+  const entryReady = Boolean(data?.entry_ready ?? signal !== "Wait");
   const support    = data?.support    != null ? Number(data.support).toLocaleString("en-IN")    : null;
   const resistance = data?.resistance != null ? Number(data.resistance).toLocaleString("en-IN") : null;
   const meta       = SIGNAL_META[signal] ?? SIGNAL_META.Wait;
+  const stateStyle =
+    state === "active" ? "bg-emerald-500/15 text-emerald-400" :
+    state === "setup"  ? "bg-amber-500/15 text-amber-400" :
+    state === "watch"  ? "bg-sky-500/15 text-sky-300" :
+                         "bg-slate-500/15 text-slate-400";
 
   // Confidence label matches MarketBiasPanel style
   const confStyle =
@@ -116,6 +124,9 @@ function SignalCard({ symbol, data, quickData, loading, error }) {
         <div className="flex flex-col items-end gap-1.5">
           <span className={clsx("text-xs font-bold px-2.5 py-1 rounded-full", meta.bg, meta.color)}>
             {meta.icon} {meta.label}
+          </span>
+          <span className={clsx("text-[11px] font-semibold px-2 py-0.5 rounded-full", stateStyle)}>
+            {String(state).toUpperCase()}
           </span>
           <span className={clsx("text-[11px] font-semibold px-2 py-0.5 rounded-full", confStyle.bg, confStyle.color)}>
             {confStyle.label} CONFIDENCE
@@ -152,6 +163,9 @@ function SignalCard({ symbol, data, quickData, loading, error }) {
         </div>
         <p className="text-[10px] text-slate-600 mt-1">
           Multi-timeframe: PCR · OI buildup · Writer dominance · Price action
+        </p>
+        <p className="text-[10px] text-slate-500 mt-1">
+          Outlook {outlook} · {entryReady ? "entry ready" : "entry not ready"}
         </p>
       </div>
 

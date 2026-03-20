@@ -7,6 +7,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.analytics.main_signal_logic import derive_signal_context
+
 
 def serialize_trading_signal_payload(row: Any | None) -> dict[str, Any]:
     if row is None:
@@ -18,8 +20,18 @@ def serialize_trading_signal_payload(row: Any | None) -> dict[str, Any]:
             "bias_5m": "Neutral",
             "bias_30m": "Neutral",
             "bias_60m": "Neutral",
+            "outlook": "Neutral",
+            "state": "idle",
+            "entry_ready": False,
             "reason": "No signal generated yet.",
         }
+    context = derive_signal_context(
+        row.signal,
+        row.bias_5m,
+        row.bias_30m,
+        row.bias_60m,
+        int(row.confidence),
+    )
     return {
         "signal": row.signal,
         "confidence": int(row.confidence),
@@ -28,6 +40,9 @@ def serialize_trading_signal_payload(row: Any | None) -> dict[str, Any]:
         "bias_5m": row.bias_5m,
         "bias_30m": row.bias_30m,
         "bias_60m": row.bias_60m,
+        "outlook": context["outlook"],
+        "state": context["state"],
+        "entry_ready": context["entry_ready"],
         "reason": row.reason,
     }
 

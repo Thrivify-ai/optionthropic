@@ -14,6 +14,8 @@ class DashboardViewUtilsTests(unittest.TestCase):
         payload = serialize_trading_signal_payload(None)
         self.assertEqual(payload["signal"], "Wait")
         self.assertEqual(payload["confidence"], 0)
+        self.assertEqual(payload["outlook"], "Neutral")
+        self.assertEqual(payload["state"], "idle")
 
     def test_summary_payload_from_cache_marks_missing_summary_pending(self) -> None:
         payload = summary_payload_from_cache(None)
@@ -45,6 +47,8 @@ class DashboardViewUtilsTests(unittest.TestCase):
         self.assertEqual(payload["signal"], "Buy CE")
         self.assertEqual(payload["confidence"], 81)
         self.assertEqual(payload["support"], 22450.0)
+        self.assertEqual(payload["outlook"], "Bullish")
+        self.assertEqual(payload["state"], "active")
 
 
 if __name__ == "__main__":

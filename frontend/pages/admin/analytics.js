@@ -15,6 +15,45 @@ function MoveCell({ move, outcomeForMove }) {
   return <span className={clsx("font-mono", good ? "text-emerald-400" : outcomeForMove === "Lost" ? "text-red-400" : "text-slate-400")}>{move >= 0 ? "+" : ""}{move}</span>;
 }
 
+function CalibrationTable({ title, rows }) {
+  return (
+    <div className="card overflow-hidden">
+      <p className="text-sm font-semibold text-slate-200 p-4 border-b border-surface-border">
+        {title}
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left">
+          <thead className="bg-surface-card border-b border-surface-border">
+            <tr className="text-[10px] uppercase tracking-wider text-slate-500">
+              <th className="p-3">Confidence</th>
+              <th className="p-3">Total</th>
+              <th className="p-3">Won</th>
+              <th className="p-3">Lost</th>
+              <th className="p-3">Unknown</th>
+              <th className="p-3">Win Rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!rows?.length && (
+              <tr><td colSpan={6} className="p-6 text-center text-slate-500">No calibration data yet</td></tr>
+            )}
+            {rows?.map((row) => (
+              <tr key={`${title}-${row.bucket}`} className="border-b border-surface-border/50 hover:bg-white/5">
+                <td className="p-3 font-mono text-slate-200">{row.bucket}</td>
+                <td className="p-3">{row.total}</td>
+                <td className="p-3 text-emerald-400">{row.won}</td>
+                <td className="p-3 text-red-400">{row.lost}</td>
+                <td className="p-3 text-slate-400">{row.unknown}</td>
+                <td className="p-3 font-mono text-slate-200">{row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export default function AdminAnalytics() {
   const router = useRouter();
   const [data, setData] = useState(null);
@@ -80,7 +119,7 @@ export default function AdminAnalytics() {
         {data && !loading && (
           <>
             <p className="text-xs text-slate-500">
-              Quick = Dashboard/Pro quick · Long = Pro swing (reason contains &quot;Swing&quot;) · Short-term: 2m/3m · Long-term: 5m/10m/30m
+              Quick = persisted quick-signal events · Long = persisted main-signal events · Short-term: 2m/3m · Long-term: 5m/10m/30m
             </p>
 
             {/* Quick Signals — short-term (2m, 3m) */}
@@ -184,6 +223,9 @@ export default function AdminAnalytics() {
                 </table>
               </div>
             </div>
+
+            <CalibrationTable title="Quick Confidence Calibration" rows={data.quick_calibration} />
+            <CalibrationTable title="Long Confidence Calibration" rows={data.long_calibration} />
           </>
         )}
       </div>

@@ -27,6 +27,12 @@ const META = {
 };
 
 const HOLD_TIP = "Scalping: hold 2–5 min. Exit on momentum flip or target hit.";
+const STATE_META = {
+  active: { label: "ACTIVE", color: "text-emerald-300", bg: "bg-emerald-500/10" },
+  candidate: { label: "SETUP", color: "text-amber-300", bg: "bg-amber-500/10" },
+  cooldown: { label: "COOLDOWN", color: "text-sky-300", bg: "bg-sky-500/10" },
+  idle: { label: "IDLE", color: "text-slate-400", bg: "bg-slate-500/10" },
+};
 
 function HistoryEntry({ entry }) {
   const meta = META[entry.signal] ?? META.Wait;
@@ -60,8 +66,16 @@ function HistoryEntry({ entry }) {
 function SymbolCard({ symbol, data, prev, history, loading, countdown, open }) {
   const qs = data?.quick_signal ?? "Wait";
   const meta = META[qs] ?? META.Wait;
+  const stateKey = data?.state ?? (qs === "Wait" ? "idle" : "active");
+  const stateMeta = STATE_META[stateKey] ?? STATE_META.idle;
   const changed = prev?.quick_signal && prev.quick_signal !== qs;
   const mom = data?.momentum;
+  const confidence = Number.isFinite(data?.confidence) ? data.confidence : null;
+  const stabilityCycles = data?.stability_cycles ?? 0;
+  const stateReason = data?.state_reason;
+  const rawSignal = data?.raw_signal ?? "Wait";
+  const activeAgeSeconds = Number.isFinite(data?.active_age_seconds) ? data.active_age_seconds : null;
+  const cooldownSeconds = Number.isFinite(data?.cooldown_seconds_remaining) ? data.cooldown_seconds_remaining : null;
   const support = data?.support != null ? Number(data.support).toLocaleString("en-IN") : null;
   const resistance = data?.resistance != null ? Number(data.resistance).toLocaleString("en-IN") : null;
   const symbolHistory = history.filter((e) => e.symbol === symbol).slice(0, MAX_HISTORY_DISPLAY);
@@ -83,12 +97,15 @@ function SymbolCard({ symbol, data, prev, history, loading, countdown, open }) {
           <span className={clsx("text-xs font-bold px-2.5 py-1 rounded-full", meta.bg, meta.color)}>
             {meta.icon} {meta.label}
           </span>
+          <span className={clsx("text-[10px] font-semibold px-2 py-0.5 rounded-full", stateMeta.bg, stateMeta.color)}>
+            {stateMeta.label}
+          </span>
           <span className="text-[10px] text-slate-600 font-mono">{countdown}s</span>
         </div>
       </div>
 
       {/* Hold-time tip for scalping */}
-      {(qs === "Buy CE" || qs === "Buy PE") && (
+      {stateKey === "active" && (qs === "Buy CE" || qs === "Buy PE") && (
         <p className="text-[10px] text-amber-400/90 bg-amber-500/5 border border-amber-500/20 rounded-lg px-2.5 py-1.5">
           ⏱ {HOLD_TIP}
         </p>
@@ -99,6 +116,17 @@ function SymbolCard({ symbol, data, prev, history, loading, countdown, open }) {
         <div className="h-16 rounded-lg bg-surface-border/20 animate-pulse" />
       ) : (
         <div className={clsx("rounded-lg border px-3 py-2 flex flex-col gap-1", changed ? "ring-1 ring-white/20" : "", "border-surface-border/50")}>
+          <div className="flex items-center justify-between gap-3 text-[10px]">
+            <span className={clsx("font-semibold", stateMeta.color)}>
+              {stateMeta.label}
+              {rawSignal !== "Wait" && stateKey !== "active" ? ` → ${rawSignal}` : ""}
+            </span>
+            {confidence != null && (
+              <span className="font-mono text-slate-400">
+                Conf {confidence}
+              </span>
+            )}
+          </div>
           {mom != null && (
             <span className={clsx("text-xs font-mono font-bold", mom > 0 ? "text-emerald-400" : mom < 0 ? "text-red-400" : "text-slate-500")}>
               Momentum {mom > 0 ? "+" : ""}{mom}
@@ -107,6 +135,28 @@ function SymbolCard({ symbol, data, prev, history, loading, countdown, open }) {
           <p className="text-[10px] text-slate-500 leading-snug line-clamp-2">
             {data?.reason || "—"}
           </p>
+          {stateReason && stateReason !== data?.reason && (
+            <p className="text-[9px] text-slate-600 leading-snug line-clamp-2">
+              {stateReason}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2 text-[9px]">
+            {stabilityCycles > 0 && (
+              <span className="rounded bg-surface-border/20 px-1.5 py-0.5 text-slate-400">
+                cycles {stabilityCycles}
+              </span>
+            )}
+            {activeAgeSeconds != null && stateKey === "active" && (
+              <span className="rounded bg-surface-border/20 px-1.5 py-0.5 text-slate-400">
+                live {activeAgeSeconds}s
+              </span>
+            )}
+            {cooldownSeconds != null && cooldownSeconds > 0 && (
+              <span className="rounded bg-surface-border/20 px-1.5 py-0.5 text-slate-400">
+                cooldown {cooldownSeconds}s
+              </span>
+            )}
+          </div>
           {(support || resistance) && (
             <div className="flex gap-3 text-[9px]">
               {support && <span className="text-emerald-500 font-mono">S {support}</span>}
@@ -213,6 +263,8 @@ export default function QuickSignalsCard() {
           level: r.current_price ?? null,
           momentum: r.momentum ?? null,
           reason: r.reason ?? null,
+          confidence: r.confidence ?? 0,
+          engine: "QUICK",
         });
         if (saved) {
           setHistory((h) => {
