@@ -39,10 +39,16 @@ from app.analytics.quick_signal_utils import (
     has_directional_persistence,
     is_quick_rangebound,
 )
+from app.config import settings
 from app.logging_config import get_logger
 from app.models.chain_snapshot import ChainSnapshot
 from app.models.underlying_bar import UnderlyingBar
 from app.services.runtime_cache import runtime_cache
+from app.services.tick_stream import (
+    get_latest_tick,
+    get_price_seconds_ago,
+    get_tick_age_seconds,
+)
 
 logger = get_logger(__name__)
 
@@ -52,6 +58,9 @@ _SYMBOL_CONFIG: dict[str, dict[str, float]] = {
         "bull_mom": 18,
         "bear_mom": -18,
         "mom_3m": 12,
+        "fast_10s": 8,
+        "fast_20s": 14,
+        "fast_60s": 24,
         "soft_ratio": 0.5,
         "pct_min": 0.0006,
         "band_pct": 0.020,
@@ -61,6 +70,9 @@ _SYMBOL_CONFIG: dict[str, dict[str, float]] = {
         "bull_mom": 45,
         "bear_mom": -45,
         "mom_3m": 30,
+        "fast_10s": 18,
+        "fast_20s": 32,
+        "fast_60s": 55,
         "soft_ratio": 0.5,
         "pct_min": 0.0006,
         "band_pct": 0.020,
@@ -70,6 +82,9 @@ _SYMBOL_CONFIG: dict[str, dict[str, float]] = {
         "bull_mom": 30,
         "bear_mom": -30,
         "mom_3m": 22,
+        "fast_10s": 24,
+        "fast_20s": 40,
+        "fast_60s": 65,
         "soft_ratio": 0.5,
         "pct_min": 0.0004,
         "band_pct": 0.015,
@@ -80,6 +95,9 @@ _DEFAULT_CONFIG: dict[str, float] = {
     "bull_mom": 22,
     "bear_mom": -22,
     "mom_3m": 15,
+    "fast_10s": 10,
+    "fast_20s": 18,
+    "fast_60s": 30,
     "soft_ratio": 0.5,
     "pct_min": 0.0006,
     "band_pct": 0.020,
@@ -88,6 +106,7 @@ _DEFAULT_CONFIG: dict[str, float] = {
 
 _VOLUME_SPIKE_RATIO = 1.5
 _QUICK_SIGNAL_STATE_TTL_SECONDS = 1800
+_SNAPSHOT_MAX_AGE_SECONDS = 150
 
 
 def _cfg(symbol: str) -> dict[str, float]:
@@ -169,6 +188,8 @@ async def _finalize_payload(
     profile: QuickSignalSessionProfile,
     now_utc: datetime,
     hard_invalidation: bool,
+    data_key: str | None = None,
+    fast_track: bool = False,
 ) -> dict[str, Any]:
     cached_state = await runtime_cache.get_json(_state_key(symbol))
     previous = parse_lifecycle_state(cached_state if isinstance(cached_state, dict) else None)
@@ -183,6 +204,8 @@ async def _finalize_payload(
         now_utc=now_utc,
         profile=profile,
         hard_invalidation=hard_invalidation,
+        data_key=data_key,
+        fast_track=fast_track,
     )
 
     ttl_seconds = max(
@@ -364,6 +387,44 @@ def _target_move(cfg: dict[str, float]) -> int:
     return int(cfg.get("target_move", 40))
 
 
+def _tick_momentum(symbol: str, seconds: int, current_price: float | None) -> float | None:
+    if current_price is None:
+        return None
+    price_then = get_price_seconds_ago(symbol, seconds)
+    if price_then is None:
+        return None
+    return round(float(current_price) - float(price_then), 2)
+
+
+def _fast_direction_consensus(direction: str, *momentums: float | None) -> bool:
+    if direction == "bullish":
+        return sum(1 for value in momentums if value is not None and value > 0) >= 2
+    if direction == "bearish":
+        return sum(1 for value in momentums if value is not None and value < 0) >= 2
+    return False
+
+
+def _attach_fast_metrics(
+    payload: dict[str, Any],
+    *,
+    momentum_10s: float | None,
+    momentum_20s: float | None,
+    momentum_60s: float | None,
+    data_source: str,
+    price_age_seconds: float | None,
+    snapshot_age_seconds: float | None,
+) -> dict[str, Any]:
+    payload["data_source"] = data_source
+    payload["momentum_10s"] = momentum_10s
+    payload["momentum_20s"] = momentum_20s
+    payload["momentum_60s"] = momentum_60s
+    payload["price_age_seconds"] = round(float(price_age_seconds), 2) if price_age_seconds is not None else None
+    payload["snapshot_age_seconds"] = (
+        round(float(snapshot_age_seconds), 2) if snapshot_age_seconds is not None else None
+    )
+    return payload
+
+
 def _signal_payload(
     symbol: str,
     signal: str,
@@ -425,13 +486,21 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
     now_utc = datetime.now(timezone.utc)
     profile = session_profile_for(now_utc)
 
-    async def _finish(payload: dict[str, Any], *, hard_invalidation: bool) -> dict[str, Any]:
+    async def _finish(
+        payload: dict[str, Any],
+        *,
+        hard_invalidation: bool,
+        data_key: str | None = None,
+        fast_track: bool = False,
+    ) -> dict[str, Any]:
         finalized = await _finalize_payload(
             symbol,
             payload,
             profile=profile,
             now_utc=now_utc,
             hard_invalidation=hard_invalidation,
+            data_key=data_key,
+            fast_track=fast_track,
         )
         return await _apply_trade_management_overlay(
             session,
@@ -446,11 +515,14 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             "Market is closed; quick signals stay paused until the next session.",
             now_utc=now_utc,
         )
-        return await _finish(payload, hard_invalidation=False)
+        return await _finish(payload, hard_invalidation=False, data_key=f"closed:{symbol}")
 
     bull_mom = adjusted_threshold(cfg["bull_mom"], profile)
     bear_mom = -adjusted_threshold(abs(cfg["bear_mom"]), profile)
     mom_3m_thresh = adjusted_threshold(cfg["mom_3m"], profile)
+    fast_10s_thresh = adjusted_threshold(cfg["fast_10s"], profile)
+    fast_20s_thresh = adjusted_threshold(cfg["fast_20s"], profile)
+    fast_60s_thresh = adjusted_threshold(cfg["fast_60s"], profile)
     pct_min = cfg["pct_min"] * profile.threshold_multiplier * 100
     soft_ratio = float(cfg.get("soft_ratio", 0.5))
     target_move = _target_move(cfg)
@@ -462,7 +534,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             "Insufficient data (need at least 2 snapshots).",
             now_utc=now_utc,
         )
-        return await _finish(payload, hard_invalidation=False)
+        return await _finish(payload, hard_invalidation=False, data_key=f"stale:{symbol}")
 
     ts_now = timestamps[0]
     ts_1m = next(
@@ -482,7 +554,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             now_utc=now_utc,
             current_price=curr["price"] if curr else None,
         )
-        return await _finish(payload, hard_invalidation=False)
+        return await _finish(payload, hard_invalidation=False, data_key=f"noprice:{symbol}")
 
     prev_1m = await _snap(session, symbol, ts_1m)
     if not prev_1m:
@@ -492,9 +564,30 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             now_utc=now_utc,
             current_price=curr["price"],
         )
-        return await _finish(payload, hard_invalidation=False)
+        return await _finish(payload, hard_invalidation=False, data_key=f"noprev:{symbol}")
 
-    spot = curr["price"]
+    snapshot_age_seconds = max(0.0, (now_utc - ts_now).total_seconds())
+    latest_tick = get_latest_tick(symbol)
+    tick_age_seconds = get_tick_age_seconds(symbol)
+    tick_price = None
+    tick_timestamp = None
+    if latest_tick is not None:
+        if latest_tick.get("price") is not None:
+            tick_price = float(latest_tick["price"])
+        tick_timestamp = latest_tick.get("timestamp")
+
+    tick_fresh = tick_price is not None and tick_age_seconds is not None and tick_age_seconds <= max(
+        12,
+        settings.fast_tick_poll_seconds * 3,
+    )
+    spot = tick_price if tick_fresh and tick_price is not None else curr["price"]
+    data_source = "tick" if tick_fresh and tick_timestamp else "snapshot"
+    data_key = (
+        f"{symbol}:{tick_timestamp}:{ts_now.isoformat()}"
+        if tick_fresh and tick_timestamp
+        else f"{symbol}:{ts_now.isoformat()}"
+    )
+
     support, resistance = await _support_resistance(
         session,
         symbol,
@@ -504,18 +597,34 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
     )
 
     bar_rows = await _recent_underlying_bars(session, symbol, limit=4)
+    price_10s = _tick_momentum(symbol, 10, spot) if tick_fresh else None
+    price_20s = _tick_momentum(symbol, 20, spot) if tick_fresh else None
+    price_60s = _tick_momentum(symbol, 60, spot) if tick_fresh else None
+    price_180s = _tick_momentum(symbol, 180, spot) if tick_fresh else None
+
     momentum_1m = round(spot - prev_1m["price"], 2)
     momentum_3m = None
     momentum_prev_leg = None
-    pct_1m = (momentum_1m / prev_1m["price"] * 100) if prev_1m["price"] else 0.0
+    reference_price_1m = prev_1m["price"]
 
-    if len(bar_rows) >= 2:
+    if price_60s is not None:
+        momentum_1m = price_60s
+        reference_price_1m = spot - price_60s
+        if price_180s is not None:
+            momentum_3m = price_180s
+            momentum_prev_leg = round(price_180s - price_60s, 2)
+        elif ts_3m is not None:
+            prev_3m = await _snap(session, symbol, ts_3m)
+            if prev_3m and prev_3m["price"]:
+                momentum_3m = round(spot - prev_3m["price"], 2)
+                momentum_prev_leg = round(reference_price_1m - prev_3m["price"], 2)
+    elif len(bar_rows) >= 2:
         latest_bar = bar_rows[0]
         prior_bar = bar_rows[1]
         latest_close = float(latest_bar.close)
         prior_close = float(prior_bar.close)
         momentum_1m = round(latest_close - prior_close, 2)
-        pct_1m = (momentum_1m / prior_close * 100) if prior_close else pct_1m
+        reference_price_1m = prior_close
         if len(bar_rows) >= 4:
             third_bar = bar_rows[3]
             momentum_3m = round(latest_close - float(third_bar.close), 2)
@@ -525,10 +634,29 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             if prev_3m and prev_3m["price"]:
                 momentum_3m = round(latest_close - prev_3m["price"], 2)
                 momentum_prev_leg = round(prior_close - prev_3m["price"], 2)
+    elif ts_3m is not None:
+        prev_3m = await _snap(session, symbol, ts_3m)
+        if prev_3m and prev_3m["price"]:
+            momentum_3m = round(spot - prev_3m["price"], 2)
+            momentum_prev_leg = round(prev_1m["price"] - prev_3m["price"], 2)
+
+    pct_1m = (momentum_1m / reference_price_1m * 100) if reference_price_1m else 0.0
+
+    fast_bullish = bool(
+        (price_10s is not None and price_10s >= fast_10s_thresh and price_20s is not None and price_20s >= fast_20s_thresh)
+        or (price_60s is not None and price_60s >= fast_60s_thresh)
+    )
+    fast_bearish = bool(
+        (price_10s is not None and price_10s <= -fast_10s_thresh and price_20s is not None and price_20s <= -fast_20s_thresh)
+        or (price_60s is not None and price_60s <= -fast_60s_thresh)
+    )
+    fast_bullish_consensus = _fast_direction_consensus("bullish", price_10s, price_20s, price_60s)
+    fast_bearish_consensus = _fast_direction_consensus("bearish", price_10s, price_20s, price_60s)
+
     soft_bull = momentum_1m >= bull_mom * soft_ratio or pct_1m >= pct_min
     soft_bear = momentum_1m <= bear_mom * soft_ratio or pct_1m <= -pct_min
-    strong_bullish = momentum_1m >= bull_mom or (pct_1m >= pct_min and momentum_1m > 0)
-    strong_bearish = momentum_1m <= bear_mom or (pct_1m <= -pct_min and momentum_1m < 0)
+    strong_bullish = fast_bullish or momentum_1m >= bull_mom or (pct_1m >= pct_min and momentum_1m > 0)
+    strong_bearish = fast_bearish or momentum_1m <= bear_mom or (pct_1m <= -pct_min and momentum_1m < 0)
 
     minute_vols: list[float] = []
     for idx in range(min(5, len(timestamps) - 1)):
@@ -564,12 +692,6 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         and spot > prev_1m["price"]
     )
 
-    if momentum_3m is None and ts_3m is not None:
-        prev_3m = await _snap(session, symbol, ts_3m)
-        if prev_3m and prev_3m["price"]:
-            momentum_3m = round(spot - prev_3m["price"], 2)
-            momentum_prev_leg = round(prev_1m["price"] - prev_3m["price"], 2)
-
     trap_bull = trap_bull or (
         resistance is not None
         and prev_1m["price"] > resistance * 1.001
@@ -598,14 +720,17 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
     bullish_trend_ok = (
         (strong_bullish and (momentum_3m is None or momentum_3m > 0))
         or (strong_bullish_3m and momentum_1m > 0)
+        or (fast_bullish and fast_bullish_consensus)
     )
     bearish_trend_ok = (
         (strong_bearish and (momentum_3m is None or momentum_3m < 0))
         or (strong_bearish_3m and momentum_1m < 0)
+        or (fast_bearish and fast_bearish_consensus)
     )
 
-    has_bull_conf = bullish_breakout or volume_spike or oi_bullish
-    has_bear_conf = bearish_breakdown or volume_spike or oi_bearish
+    snapshot_fresh = snapshot_age_seconds <= _SNAPSHOT_MAX_AGE_SECONDS
+    has_bull_conf = bullish_breakout or volume_spike or oi_bullish or (fast_bullish and snapshot_fresh)
+    has_bear_conf = bearish_breakdown or volume_spike or oi_bearish or (fast_bearish and snapshot_fresh)
     soft_bull_ok = soft_bull and (momentum_3m is None or momentum_3m > 0) and has_bull_conf
     soft_bear_ok = soft_bear and (momentum_3m is None or momentum_3m < 0) and has_bear_conf
 
@@ -613,12 +738,12 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         momentum_1m,
         momentum_prev_leg,
         "bullish",
-    )
+    ) or fast_bullish_consensus
     bearish_persistent = has_directional_persistence(
         momentum_1m,
         momentum_prev_leg,
         "bearish",
-    )
+    ) or fast_bearish_consensus
 
     bullish_ready = (bullish_trend_ok or soft_bull_ok) and bullish_persistent and not trap_bull
     bearish_ready = (bearish_trend_ok or soft_bear_ok) and bearish_persistent and not trap_bear
@@ -656,6 +781,8 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         rangebound=rangebound,
         risk_reward_ok=bullish_rr_ok,
     )
+    if fast_bullish and tick_fresh:
+        bullish_confidence = min(100, bullish_confidence + 8)
     bearish_confidence = quick_signal_confidence(
         bullish=False,
         bearish=True,
@@ -670,9 +797,13 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         rangebound=rangebound,
         risk_reward_ok=bearish_rr_ok,
     )
+    if fast_bearish and tick_fresh:
+        bearish_confidence = min(100, bearish_confidence + 8)
 
     bullish_live = bullish_ready and bullish_rr_ok and bullish_confidence >= profile.min_confidence
     bearish_live = bearish_ready and bearish_rr_ok and bearish_confidence >= profile.min_confidence
+    bullish_fast_track = bullish_live and fast_bullish and tick_fresh and bullish_confidence >= profile.min_confidence + 6
+    bearish_fast_track = bearish_live and fast_bearish and tick_fresh and bearish_confidence >= profile.min_confidence + 6
 
     if bullish_live and not bearish_live:
         ext: list[str] = []
@@ -682,6 +813,8 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             ext.append("call covering with put support")
         if volume_spike:
             ext.append("volume expansion")
+        if fast_bullish and price_10s is not None:
+            ext.append(f"fast tape +{price_10s:.0f} in 10s")
         ext.append(bullish_rr_reason)
         reason = (
             f"+{momentum_1m:.0f} pts in 1m"
@@ -711,7 +844,21 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
         )
-        return await _finish(payload, hard_invalidation=hard_invalidation)
+        payload = _attach_fast_metrics(
+            payload,
+            momentum_10s=price_10s,
+            momentum_20s=price_20s,
+            momentum_60s=price_60s,
+            data_source=data_source,
+            price_age_seconds=tick_age_seconds,
+            snapshot_age_seconds=snapshot_age_seconds,
+        )
+        return await _finish(
+            payload,
+            hard_invalidation=hard_invalidation,
+            data_key=data_key,
+            fast_track=bullish_fast_track,
+        )
 
     if bearish_live and not bullish_live:
         ext = []
@@ -721,6 +868,8 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             ext.append("put covering with call pressure")
         if volume_spike:
             ext.append("volume expansion")
+        if fast_bearish and price_10s is not None:
+            ext.append(f"fast tape {price_10s:.0f} in 10s")
         ext.append(bearish_rr_reason)
         reason = (
             f"{momentum_1m:.0f} pts in 1m"
@@ -750,7 +899,21 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
         )
-        return await _finish(payload, hard_invalidation=hard_invalidation)
+        payload = _attach_fast_metrics(
+            payload,
+            momentum_10s=price_10s,
+            momentum_20s=price_20s,
+            momentum_60s=price_60s,
+            data_source=data_source,
+            price_age_seconds=tick_age_seconds,
+            snapshot_age_seconds=snapshot_age_seconds,
+        )
+        return await _finish(
+            payload,
+            hard_invalidation=hard_invalidation,
+            data_key=data_key,
+            fast_track=bearish_fast_track,
+        )
 
     if bullish_ready and bearish_ready:
         wait_reason = "Bullish and bearish intraday evidence conflict; waiting for cleaner direction."
@@ -776,7 +939,16 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
         )
-        return await _finish(payload, hard_invalidation=hard_invalidation)
+        payload = _attach_fast_metrics(
+            payload,
+            momentum_10s=price_10s,
+            momentum_20s=price_20s,
+            momentum_60s=price_60s,
+            data_source=data_source,
+            price_age_seconds=tick_age_seconds,
+            snapshot_age_seconds=snapshot_age_seconds,
+        )
+        return await _finish(payload, hard_invalidation=hard_invalidation, data_key=data_key)
 
     wait_reasons: list[str] = []
     confidence = max(bullish_confidence, bearish_confidence)
@@ -806,6 +978,8 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             msg = f"1m {momentum_1m:+.0f} pts vs threshold {bull_mom:.0f}"
             if momentum_3m is not None:
                 msg += f"; 3m {momentum_3m:+.0f} pts vs threshold {mom_3m_thresh:.0f}"
+            if price_10s is not None and price_20s is not None:
+                msg += f"; 10s {price_10s:+.0f}; 20s {price_20s:+.0f}"
             wait_reasons.append(f"momentum is below the required session-adjusted threshold ({msg})")
         elif (soft_bull and not has_bull_conf) or (soft_bear and not has_bear_conf):
             wait_reasons.append("momentum appeared, but breakout, volume, or OI confirmation is still missing")
@@ -842,4 +1016,13 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         call_oi_delta=call_oi_delta,
         put_oi_delta=put_oi_delta,
     )
-    return await _finish(payload, hard_invalidation=hard_invalidation)
+    payload = _attach_fast_metrics(
+        payload,
+        momentum_10s=price_10s,
+        momentum_20s=price_20s,
+        momentum_60s=price_60s,
+        data_source=data_source,
+        price_age_seconds=tick_age_seconds,
+        snapshot_age_seconds=snapshot_age_seconds,
+    )
+    return await _finish(payload, hard_invalidation=hard_invalidation, data_key=data_key)

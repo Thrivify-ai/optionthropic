@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     environment: Literal["development", "staging", "production"] = "development"
     log_level: str = "INFO"
     poll_interval_seconds: int = 45
+    fast_tick_poll_seconds: int = 5
 
     # Database
     database_url: str = "postgresql+asyncpg://optionthropic:optionthropic_secret@localhost:5432/optionthropic"

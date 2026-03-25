@@ -434,7 +434,7 @@ export default function QuickSignalsCard() {
             <p className="section-kicker">Fast Tape</p>
             <h3 className="mt-1 text-lg font-semibold text-slate-100">Quick Signals</h3>
             <p className="mt-1 text-xs leading-relaxed text-slate-400">
-              Momentum, breakout, volume, and OI confirmation on a 15 second refresh cycle.
+              Fast tape sampled in the background every few seconds, with the desk view refreshing every 15 seconds.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">

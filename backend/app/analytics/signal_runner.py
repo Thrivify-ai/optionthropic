@@ -18,9 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics.main_signal_logic import (
     FeatureView,
+    determine_main_outlook,
     derive_signal_context,
     generate_main_signal_from_features,
 )
+from app.analytics.main_signal_runtime import load_long_signal_context
+from app.analytics.main_trade_management import derive_main_trade_management_plan
 from app.analytics.gamma_detection import compute_gamma_walls
 from app.analytics.max_pain_detection import compute_max_pain
 from app.analytics.options_analysis import compute_pcr
@@ -37,7 +40,7 @@ from app.analytics.signal_outcomes import (
     refresh_pending_signal_outcomes,
 )
 from app.analytics.signal_engine import Bias, Signal, TradingSignal
-from app.analytics.trade_manager import apply_managed_trade_decision
+from app.analytics.trade_manager import apply_managed_trade_decision, get_open_trade_row, trade_state_from_row
 from app.config import settings
 from app.db.database import AsyncSessionLocal
 from app.logging_config import get_logger
@@ -70,6 +73,7 @@ async def _latest_feature_views(
             timeframe=row.timeframe,
             current_price=float(row.current_price),
             prev_price=float(row.prev_price),
+            snapshot_timestamp=row.snapshot_timestamp,
             price_change_pct=float(row.price_change_pct),
             pcr_oi=float(row.pcr_oi) if row.pcr_oi is not None else None,
             support_strike=float(row.support_strike) if row.support_strike is not None else None,
@@ -419,15 +423,19 @@ async def run_signal_engine_cycle() -> None:
                 f5_views = await _latest_feature_views(session, symbol, "5m", limit=2)
                 f30_views = await _latest_feature_views(session, symbol, "30m", limit=2)
                 f60_views = await _latest_feature_views(session, symbol, "60m", limit=2)
+                long_context = None
 
                 if f5_views and f30_views and f60_views:
                     previous_views = None
                     if len(f5_views) > 1 and len(f30_views) > 1 and len(f60_views) > 1:
                         previous_views = (f5_views[1], f30_views[1], f60_views[1])
+                    current_reference_time = f5_views[0].snapshot_timestamp or datetime.now(timezone.utc)
+                    long_context = await load_long_signal_context(session, symbol, current_reference_time)
                     ts = generate_main_signal_from_features(
                         symbol,
                         (f5_views[0], f30_views[0], f60_views[0]),
                         previous_views,
+                        context=long_context,
                     )
                 else:
                     ts = _make_signal(symbol, sentiment, snap5, snap30, snap60)
@@ -454,6 +462,9 @@ async def run_signal_engine_cycle() -> None:
 
                 managed_hard_exit = False
                 managed_hard_exit_reason = None
+                managed_base_signal = ts.signal.value
+                open_main_trade_row = await get_open_trade_row(session, engine="MAIN", symbol=symbol)
+                open_main_trade = trade_state_from_row(open_main_trade_row)
                 if f5_views and f30_views and f60_views:
                     current_f5 = f5_views[0]
                     current_f30 = f30_views[0]
@@ -471,12 +482,30 @@ async def run_signal_engine_cycle() -> None:
                     ):
                         managed_hard_exit = True
                         managed_hard_exit_reason = "30m and 60m both slipped back into rangebound conditions."
+                    if not managed_hard_exit:
+                        long_outlook = determine_main_outlook(
+                            (current_f5, current_f30, current_f60),
+                            long_context,
+                        )
+                        management_plan = derive_main_trade_management_plan(
+                            open_trade=open_main_trade,
+                            current_features=(current_f5, current_f30, current_f60),
+                            long_context=long_context,
+                            outlook=long_outlook,
+                            confidence=int(ts.confidence),
+                            current_price=entry_price,
+                        )
+                        if management_plan.base_signal_override is not None:
+                            managed_base_signal = management_plan.base_signal_override
+                        if management_plan.hard_exit:
+                            managed_hard_exit = True
+                            managed_hard_exit_reason = management_plan.hard_exit_reason
 
                 managed_decision, _managed_trade_row = await apply_managed_trade_decision(
                     session,
                     engine="MAIN",
                     symbol=symbol,
-                    base_signal=ts.signal.value,
+                    base_signal=managed_base_signal,
                     confidence=int(ts.confidence),
                     current_price=entry_price,
                     reason=ts.reason,

@@ -92,6 +92,7 @@ class QuickSignalPhase2Tests(unittest.TestCase):
             now_utc=now_utc,
             profile=profile,
             hard_invalidation=False,
+            data_key="tick-1",
         )
         self.assertEqual(payload["quick_signal"], "Wait")
         self.assertEqual(payload["state"], "candidate")
@@ -104,10 +105,61 @@ class QuickSignalPhase2Tests(unittest.TestCase):
             now_utc=now_utc + timedelta(seconds=15),
             profile=profile,
             hard_invalidation=False,
+            data_key="tick-2",
         )
         self.assertEqual(payload["quick_signal"], "Buy CE")
         self.assertEqual(payload["state"], "active")
         self.assertEqual(state.active_signal, "Buy CE")
+
+    def test_lifecycle_does_not_double_count_same_market_data(self) -> None:
+        profile = session_profile_for(datetime(2026, 3, 20, 4, 5, tzinfo=timezone.utc))
+        state = QuickSignalLifecycleState()
+        now_utc = datetime(2026, 3, 20, 4, 5, tzinfo=timezone.utc)
+
+        state, payload = apply_lifecycle(
+            state,
+            raw_signal="Buy PE",
+            confidence=81,
+            now_utc=now_utc,
+            profile=profile,
+            hard_invalidation=False,
+            data_key="same-data",
+        )
+        self.assertEqual(payload["state"], "candidate")
+        self.assertEqual(payload["stability_cycles"], 1)
+
+        state, payload = apply_lifecycle(
+            state,
+            raw_signal="Buy PE",
+            confidence=83,
+            now_utc=now_utc + timedelta(seconds=10),
+            profile=profile,
+            hard_invalidation=False,
+            data_key="same-data",
+        )
+        self.assertEqual(payload["quick_signal"], "Wait")
+        self.assertEqual(payload["state"], "candidate")
+        self.assertEqual(payload["stability_cycles"], 1)
+        self.assertIn("unchanged", payload["state_reason"].lower())
+
+    def test_fast_track_can_activate_on_first_fresh_impulse(self) -> None:
+        profile = session_profile_for(datetime(2026, 3, 20, 8, 10, tzinfo=timezone.utc))
+        state = QuickSignalLifecycleState()
+        now_utc = datetime(2026, 3, 20, 8, 10, tzinfo=timezone.utc)
+
+        state, payload = apply_lifecycle(
+            state,
+            raw_signal="Buy PE",
+            confidence=91,
+            now_utc=now_utc,
+            profile=profile,
+            hard_invalidation=False,
+            data_key="impulse-1",
+            fast_track=True,
+        )
+        self.assertEqual(payload["quick_signal"], "Buy PE")
+        self.assertEqual(payload["state"], "active")
+        self.assertEqual(state.active_signal, "Buy PE")
 
     def test_lifecycle_holds_active_signal_through_brief_pause(self) -> None:
         profile = session_profile_for(datetime(2026, 3, 20, 4, 5, tzinfo=timezone.utc))

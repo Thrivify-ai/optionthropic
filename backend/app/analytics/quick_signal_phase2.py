@@ -32,6 +32,7 @@ class QuickSignalLifecycleState:
     last_seen_at: str | None = None
     cooldown_until: str | None = None
     confidence: int = 0
+    last_data_key: str | None = None
 
 
 def session_profile_for(now_utc: datetime | None = None) -> QuickSignalSessionProfile:
@@ -147,6 +148,7 @@ def parse_lifecycle_state(payload: dict[str, Any] | None) -> QuickSignalLifecycl
         last_seen_at=payload.get("last_seen_at"),
         cooldown_until=payload.get("cooldown_until"),
         confidence=int(payload.get("confidence", 0) or 0),
+        last_data_key=payload.get("last_data_key"),
     )
 
 
@@ -174,6 +176,8 @@ def apply_lifecycle(
     now_utc: datetime,
     profile: QuickSignalSessionProfile,
     hard_invalidation: bool,
+    data_key: str | None = None,
+    fast_track: bool = False,
 ) -> tuple[QuickSignalLifecycleState, dict[str, Any]]:
     now_iso = now_utc.isoformat()
     state = QuickSignalLifecycleState(
@@ -185,12 +189,14 @@ def apply_lifecycle(
         last_seen_at=previous.last_seen_at,
         cooldown_until=previous.cooldown_until,
         confidence=previous.confidence,
+        last_data_key=previous.last_data_key,
     )
 
     activated_at = _parse_ts(state.activated_at)
     cooldown_until = _parse_ts(state.cooldown_until)
     active_age = int((now_utc - activated_at).total_seconds()) if activated_at else 0
     cooldown_remaining = int((cooldown_until - now_utc).total_seconds()) if cooldown_until and cooldown_until > now_utc else 0
+    required_cycles = 1 if fast_track else profile.confirm_cycles
 
     if hard_invalidation and state.active_signal:
         state.state = "cooldown"
@@ -199,6 +205,7 @@ def apply_lifecycle(
         state.active_signal = None
         state.cooldown_until = (now_utc + timedelta(seconds=profile.cooldown_seconds)).isoformat()
         state.confidence = confidence
+        state.last_data_key = data_key
         return state, {
             "quick_signal": "Wait",
             "state": "cooldown",
@@ -214,6 +221,7 @@ def apply_lifecycle(
         state.candidate_signal = None
         state.candidate_count = 0
         state.confidence = confidence
+        state.last_data_key = data_key
         return state, {
             "quick_signal": "Wait",
             "state": "cooldown",
@@ -228,10 +236,11 @@ def apply_lifecycle(
             state.state = "active"
             state.last_seen_at = now_iso
             state.confidence = confidence
+            state.last_data_key = data_key or state.last_data_key
             return state, {
                 "quick_signal": state.active_signal,
                 "state": "active",
-                "stability_cycles": max(profile.confirm_cycles, state.candidate_count),
+                "stability_cycles": max(required_cycles, state.candidate_count),
                 "active_age_seconds": active_age,
                 "cooldown_seconds_remaining": 0,
                 "state_reason": "Active signal remains aligned and confirmed.",
@@ -240,10 +249,11 @@ def apply_lifecycle(
         if raw_signal == "Wait" and active_age < profile.min_hold_seconds:
             state.state = "active"
             state.confidence = max(state.confidence, confidence)
+            state.last_data_key = data_key or state.last_data_key
             return state, {
                 "quick_signal": state.active_signal,
                 "state": "active",
-                "stability_cycles": max(profile.confirm_cycles, state.candidate_count),
+                "stability_cycles": max(required_cycles, state.candidate_count),
                 "active_age_seconds": active_age,
                 "cooldown_seconds_remaining": 0,
                 "state_reason": "Holding the active signal through a brief pause inside the minimum hold window.",
@@ -251,10 +261,11 @@ def apply_lifecycle(
 
         if raw_signal in BUY_SIGNALS and raw_signal != state.active_signal and active_age < profile.min_hold_seconds:
             state.state = "active"
+            state.last_data_key = data_key or state.last_data_key
             return state, {
                 "quick_signal": state.active_signal,
                 "state": "active",
-                "stability_cycles": max(profile.confirm_cycles, state.candidate_count),
+                "stability_cycles": max(required_cycles, state.candidate_count),
                 "active_age_seconds": active_age,
                 "cooldown_seconds_remaining": 0,
                 "state_reason": "Opposite direction appeared, but the current active signal is still inside its minimum hold window.",
@@ -266,6 +277,7 @@ def apply_lifecycle(
         state.active_signal = None
         state.cooldown_until = (now_utc + timedelta(seconds=profile.cooldown_seconds)).isoformat()
         state.confidence = confidence
+        state.last_data_key = data_key
         return state, {
             "quick_signal": "Wait",
             "state": "cooldown",
@@ -276,17 +288,29 @@ def apply_lifecycle(
         }
 
     if raw_signal in BUY_SIGNALS:
-        if state.candidate_signal == raw_signal:
+        fresh_market_data = state.last_data_key != data_key
+        if state.candidate_signal == raw_signal and state.last_data_key != data_key:
             state.candidate_count += 1
-        else:
+        elif state.candidate_signal != raw_signal:
             state.candidate_signal = raw_signal
             state.candidate_count = 1
 
         state.state = "candidate"
         state.confidence = confidence
         state.last_seen_at = now_iso
+        state.last_data_key = data_key
 
-        if state.candidate_count >= profile.confirm_cycles:
+        if not fresh_market_data and state.candidate_count < required_cycles:
+            return state, {
+                "quick_signal": "Wait",
+                "state": "candidate",
+                "stability_cycles": state.candidate_count,
+                "active_age_seconds": 0,
+                "cooldown_seconds_remaining": 0,
+                "state_reason": "Setup is unchanged; waiting for the next fresh market update before activation.",
+            }
+
+        if state.candidate_count >= required_cycles:
             state.state = "active"
             state.active_signal = raw_signal
             state.activated_at = now_iso
@@ -317,6 +341,7 @@ def apply_lifecycle(
     state.last_seen_at = now_iso
     state.cooldown_until = None
     state.confidence = confidence
+    state.last_data_key = data_key
     return state, {
         "quick_signal": "Wait",
         "state": "idle",
