@@ -1,10 +1,13 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from app.services.market_hours import (
     ai_cache_ttl_seconds,
     dashboard_cache_ttl_seconds,
     is_indian_market_open,
+    latest_completed_trading_day,
+    needs_completed_day_refresh,
+    previous_trading_day,
     should_refresh_intraday_caches,
 )
 
@@ -28,6 +31,27 @@ class MarketHoursTests(unittest.TestCase):
         sunday_closed = datetime(2026, 3, 22, 4, 30, tzinfo=timezone.utc)
         self.assertLess(dashboard_cache_ttl_seconds(monday_open), dashboard_cache_ttl_seconds(sunday_closed))
         self.assertLess(ai_cache_ttl_seconds(monday_open), ai_cache_ttl_seconds(sunday_closed))
+
+    def test_previous_trading_day_skips_weekend(self) -> None:
+        self.assertEqual(previous_trading_day(date(2026, 3, 23)), date(2026, 3, 20))
+
+    def test_latest_completed_trading_day_is_previous_day_before_close(self) -> None:
+        monday_mid_session = datetime(2026, 3, 23, 5, 30, tzinfo=timezone.utc)  # 11:00 IST
+        self.assertEqual(latest_completed_trading_day(monday_mid_session), date(2026, 3, 20))
+
+    def test_latest_completed_trading_day_is_today_after_close(self) -> None:
+        monday_after_close = datetime(2026, 3, 23, 11, 30, tzinfo=timezone.utc)  # 17:00 IST
+        self.assertEqual(latest_completed_trading_day(monday_after_close), date(2026, 3, 23))
+
+    def test_completed_day_refresh_triggers_when_latest_snapshot_is_stale(self) -> None:
+        monday_after_close = datetime(2026, 3, 23, 11, 30, tzinfo=timezone.utc)  # 17:00 IST
+        stale_snapshot = datetime(2026, 3, 23, 8, 0, tzinfo=timezone.utc)  # 13:30 IST
+        self.assertTrue(needs_completed_day_refresh(stale_snapshot, monday_after_close))
+
+    def test_completed_day_refresh_skips_when_snapshot_near_session_close(self) -> None:
+        monday_after_close = datetime(2026, 3, 23, 11, 30, tzinfo=timezone.utc)  # 17:00 IST
+        fresh_snapshot = datetime(2026, 3, 23, 9, 55, tzinfo=timezone.utc)  # 15:25 IST
+        self.assertFalse(needs_completed_day_refresh(fresh_snapshot, monday_after_close))
 
 
 if __name__ == "__main__":

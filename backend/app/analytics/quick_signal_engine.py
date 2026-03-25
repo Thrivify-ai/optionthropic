@@ -31,6 +31,10 @@ from app.analytics.quick_signal_phase2 import (
     serialize_lifecycle_state,
     session_profile_for,
 )
+from app.analytics.trade_manager import (
+    apply_managed_trade_decision,
+    serialize_trade_summary,
+)
 from app.analytics.quick_signal_utils import (
     has_directional_persistence,
     is_quick_rangebound,
@@ -197,6 +201,58 @@ async def _finalize_payload(
     payload["session"] = profile.name
     payload["reason"] = _compose_reason(payload.get("reason", ""), lifecycle_payload["state_reason"])
     payload["timestamp"] = _timestamp_now(now_utc)
+    return payload
+
+
+async def _apply_trade_management_overlay(
+    session: AsyncSession,
+    symbol: str,
+    payload: dict[str, Any],
+    *,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    current_price = payload.get("current_price")
+    current_price_value = float(current_price) if current_price is not None else None
+    base_signal = str(payload.get("quick_signal") or "Wait")
+    hard_exit = payload.get("state") == "cooldown" or payload.get("session") == "closed"
+    hard_exit_reason = str(payload.get("state_reason") or payload.get("reason") or "")
+
+    decision, trade_row = await apply_managed_trade_decision(
+        session,
+        engine="QUICK",
+        symbol=symbol,
+        base_signal=base_signal,
+        confidence=int(payload.get("confidence", 0) or 0),
+        current_price=current_price_value,
+        reason=str(payload.get("reason") or ""),
+        now_utc=now_utc,
+        hard_exit=hard_exit,
+        hard_exit_reason=hard_exit_reason,
+    )
+
+    payload["base_quick_signal"] = base_signal
+    payload["quick_signal"] = decision.public_signal
+    payload["trade_state"] = decision.trade_state
+    payload["trade_action"] = decision.action
+    payload["entry_price"] = round(float(decision.entry_price), 2) if decision.entry_price is not None else None
+    payload["current_points"] = round(float(decision.current_points), 2) if decision.current_points is not None else None
+    payload["success_threshold_points"] = round(float(decision.success_threshold_points), 2)
+    payload["stop_points"] = round(float(decision.stop_points), 2)
+    payload["hold_cycles"] = int(decision.hold_cycles)
+    payload["max_favorable_points"] = (
+        round(float(decision.max_favorable_points), 2)
+        if decision.max_favorable_points is not None
+        else None
+    )
+    payload["max_adverse_points"] = (
+        round(float(decision.max_adverse_points), 2)
+        if decision.max_adverse_points is not None
+        else None
+    )
+    payload["management_reason"] = decision.management_reason
+    payload["trade"] = serialize_trade_summary(trade_row)
+    if decision.action in {"hold", "exit"}:
+        payload["reason"] = decision.management_reason
     return payload
 
 
@@ -369,19 +425,28 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
     now_utc = datetime.now(timezone.utc)
     profile = session_profile_for(now_utc)
 
+    async def _finish(payload: dict[str, Any], *, hard_invalidation: bool) -> dict[str, Any]:
+        finalized = await _finalize_payload(
+            symbol,
+            payload,
+            profile=profile,
+            now_utc=now_utc,
+            hard_invalidation=hard_invalidation,
+        )
+        return await _apply_trade_management_overlay(
+            session,
+            symbol,
+            finalized,
+            now_utc=now_utc,
+        )
+
     if profile.name == "closed":
         payload = _wait_payload(
             symbol,
             "Market is closed; quick signals stay paused until the next session.",
             now_utc=now_utc,
         )
-        return await _finalize_payload(
-            symbol,
-            payload,
-            profile=profile,
-            now_utc=now_utc,
-            hard_invalidation=False,
-        )
+        return await _finish(payload, hard_invalidation=False)
 
     bull_mom = adjusted_threshold(cfg["bull_mom"], profile)
     bear_mom = -adjusted_threshold(abs(cfg["bear_mom"]), profile)
@@ -397,13 +462,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             "Insufficient data (need at least 2 snapshots).",
             now_utc=now_utc,
         )
-        return await _finalize_payload(
-            symbol,
-            payload,
-            profile=profile,
-            now_utc=now_utc,
-            hard_invalidation=False,
-        )
+        return await _finish(payload, hard_invalidation=False)
 
     ts_now = timestamps[0]
     ts_1m = next(
@@ -423,13 +482,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             now_utc=now_utc,
             current_price=curr["price"] if curr else None,
         )
-        return await _finalize_payload(
-            symbol,
-            payload,
-            profile=profile,
-            now_utc=now_utc,
-            hard_invalidation=False,
-        )
+        return await _finish(payload, hard_invalidation=False)
 
     prev_1m = await _snap(session, symbol, ts_1m)
     if not prev_1m:
@@ -439,13 +492,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             now_utc=now_utc,
             current_price=curr["price"],
         )
-        return await _finalize_payload(
-            symbol,
-            payload,
-            profile=profile,
-            now_utc=now_utc,
-            hard_invalidation=False,
-        )
+        return await _finish(payload, hard_invalidation=False)
 
     spot = curr["price"]
     support, resistance = await _support_resistance(
@@ -664,13 +711,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
         )
-        return await _finalize_payload(
-            symbol,
-            payload,
-            profile=profile,
-            now_utc=now_utc,
-            hard_invalidation=hard_invalidation,
-        )
+        return await _finish(payload, hard_invalidation=hard_invalidation)
 
     if bearish_live and not bullish_live:
         ext = []
@@ -709,13 +750,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
         )
-        return await _finalize_payload(
-            symbol,
-            payload,
-            profile=profile,
-            now_utc=now_utc,
-            hard_invalidation=hard_invalidation,
-        )
+        return await _finish(payload, hard_invalidation=hard_invalidation)
 
     if bullish_ready and bearish_ready:
         wait_reason = "Bullish and bearish intraday evidence conflict; waiting for cleaner direction."
@@ -741,13 +776,7 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
         )
-        return await _finalize_payload(
-            symbol,
-            payload,
-            profile=profile,
-            now_utc=now_utc,
-            hard_invalidation=hard_invalidation,
-        )
+        return await _finish(payload, hard_invalidation=hard_invalidation)
 
     wait_reasons: list[str] = []
     confidence = max(bullish_confidence, bearish_confidence)
@@ -813,10 +842,4 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         call_oi_delta=call_oi_delta,
         put_oi_delta=put_oi_delta,
     )
-    return await _finalize_payload(
-        symbol,
-        payload,
-        profile=profile,
-        now_utc=now_utc,
-        hard_invalidation=hard_invalidation,
-    )
+    return await _finish(payload, hard_invalidation=hard_invalidation)

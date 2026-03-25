@@ -6,7 +6,7 @@ based on the DATA_SOURCE environment variable.
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 
 import aiohttp
@@ -14,6 +14,7 @@ from app.config import settings
 from app.logging_config import get_logger
 
 logger = get_logger(__name__)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # ─── Protocol ──────────────────────────────────────────────────────────────────
 
@@ -136,6 +137,7 @@ def _parse_nse_chain(raw: dict, symbol: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     try:
         underlying = raw["records"]["underlyingValue"]
+        source_timestamp = _parse_nse_source_timestamp(raw["records"].get("timestamp"))
         for entry in raw["records"]["data"]:
             strike = entry["strikePrice"]
             expiry_str = entry["expiryDate"]
@@ -155,6 +157,7 @@ def _parse_nse_chain(raw: dict, symbol: str) -> list[dict[str, Any]]:
                         "volume": int(leg.get("totalTradedVolume", 0)),
                         "last_price": float(leg.get("lastPrice", 0)),
                         "underlying_price": float(underlying),
+                        "source_timestamp": source_timestamp,
                     }
                 )
     except (KeyError, TypeError, ValueError) as exc:
@@ -171,6 +174,17 @@ def _parse_expiry(expiry_str: str) -> date:
         except ValueError:
             continue
     return date.today()
+
+
+def _parse_nse_source_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%d-%b-%Y %H:%M:%S %Z"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=IST).astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 # ─── Zerodha Source ────────────────────────────────────────────────────────────

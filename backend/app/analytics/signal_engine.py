@@ -34,6 +34,10 @@ class Bias(str, Enum):
 class Signal(str, Enum):
     BUY_CE = "Buy CE"
     BUY_PE = "Buy PE"
+    HOLD_CE = "Hold CE"
+    HOLD_PE = "Hold PE"
+    EXIT_CE = "Exit CE"
+    EXIT_PE = "Exit PE"
     WAIT = "Wait"
 
 

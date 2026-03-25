@@ -311,9 +311,17 @@ def derive_signal_context(
     bias_60m: str,
     confidence: int,
 ) -> dict[str, object]:
-    if signal in ("Buy CE", "Buy PE"):
+    if signal in ("Buy CE", "Buy PE", "Hold CE", "Hold PE"):
         outlook = "Bullish" if signal == "Buy CE" else "Bearish"
+        if signal == "Hold CE":
+            outlook = "Bullish"
+        if signal == "Hold PE":
+            outlook = "Bearish"
         return {"outlook": outlook, "state": "active", "entry_ready": True}
+
+    if signal in ("Exit CE", "Exit PE"):
+        outlook = "Bullish" if signal == "Exit CE" else "Bearish"
+        return {"outlook": outlook, "state": "exit", "entry_ready": False}
 
     if bias_60m == bias_30m and bias_60m in ("Bullish", "Bearish"):
         state = "setup" if confidence >= 45 else "watch"

@@ -10,7 +10,7 @@ from typing import Any
 from app.analytics.main_signal_logic import derive_signal_context
 
 
-def serialize_trading_signal_payload(row: Any | None) -> dict[str, Any]:
+def serialize_trading_signal_payload(row: Any | None, trade: dict[str, Any] | None = None) -> dict[str, Any]:
     if row is None:
         return {
             "signal": "Wait",
@@ -24,6 +24,7 @@ def serialize_trading_signal_payload(row: Any | None) -> dict[str, Any]:
             "state": "idle",
             "entry_ready": False,
             "reason": "No signal generated yet.",
+            "trade": trade,
         }
     context = derive_signal_context(
         row.signal,
@@ -44,6 +45,7 @@ def serialize_trading_signal_payload(row: Any | None) -> dict[str, Any]:
         "state": context["state"],
         "entry_ready": context["entry_ready"],
         "reason": row.reason,
+        "trade": trade,
     }
 
 

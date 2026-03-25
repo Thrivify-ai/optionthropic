@@ -18,6 +18,7 @@ from app.analytics.max_pain_detection import compute_max_pain
 from app.analytics.options_analysis import compute_pcr, compute_support_resistance
 from app.analytics.options_flow_detection import detect_options_flow
 from app.analytics.quick_signal import get_quick_signal
+from app.analytics.trade_manager import get_latest_trade_row, get_open_trade_row, serialize_trade_summary
 from app.config import settings
 from app.db.database import AsyncSessionLocal
 from app.models.dashboard_snapshot_cache import DashboardSnapshotCache
@@ -44,6 +45,9 @@ async def build_dashboard_snapshot_for_symbol(session: AsyncSession, symbol: str
             .limit(1)
         )
     ).scalars().first()
+    trade_row = await get_open_trade_row(session, engine="MAIN", symbol=symbol)
+    if trade_row is None:
+        trade_row = await get_latest_trade_row(session, engine="MAIN", symbol=symbol)
 
     source_timestamp = options_chain_pcr.get("latest_snapshot_at") or support_resistance.get("timestamp")
     return {
@@ -56,7 +60,10 @@ async def build_dashboard_snapshot_for_symbol(session: AsyncSession, symbol: str
         "max_pain": max_pain,
         "liquidity_traps": traps,
         "options_flow": flow,
-        "trading_signal": serialize_trading_signal_payload(trading_row),
+        "trading_signal": serialize_trading_signal_payload(
+            trading_row,
+            serialize_trade_summary(trade_row),
+        ),
         "quick_signal": quick_signal,
         "source_timestamp": source_timestamp,
         "generated_at": datetime.now(timezone.utc).isoformat(),

@@ -11,7 +11,10 @@ class TradingSignalRow(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(20), index=True, nullable=False)
-    signal: Mapped[str] = mapped_column(String(20), nullable=False)  # "Buy CE" | "Buy PE" | "Wait"
+    signal: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )  # "Buy CE" | "Buy PE" | "Hold CE" | "Hold PE" | "Exit CE" | "Exit PE" | "Wait"
     confidence: Mapped[int] = mapped_column(Integer, nullable=False)
 
     support: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)

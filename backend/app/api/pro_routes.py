@@ -11,6 +11,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.alerts.global_news import get_global_news_alerts_payload
 from app.analytics.commodity_signals import commodity_long_term_signal, commodity_quick_signal
 from app.analytics.explanation_engine import explain_commodity_signal, explain_signal
 from app.analytics.mcx_prices import get_mcx_prices
@@ -92,6 +93,21 @@ async def get_pro_signals(
             "explanation": explain_signal(q_sig, s_sig),
         }
     return result
+
+
+@router.get("/global-alerts")
+async def get_pro_global_alerts(
+    session: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[User, Depends(require_pro)],
+) -> dict[str, Any]:
+    """
+    Curated world-news alerts filtered to only potentially market-moving items.
+    """
+    return await get_global_news_alerts_payload(
+        session,
+        allow_stale=True,
+        refresh_if_missing=True,
+    )
 
 
 @router.get("/commodities")

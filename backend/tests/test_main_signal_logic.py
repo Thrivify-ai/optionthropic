@@ -109,6 +109,18 @@ class MainSignalLogicTests(unittest.TestCase):
         self.assertEqual(ctx["state"], "setup")
         self.assertFalse(ctx["entry_ready"])
 
+    def test_derive_signal_context_marks_hold_as_active(self) -> None:
+        ctx = derive_signal_context("Hold CE", "Bullish", "Bullish", "Bullish", 74)
+        self.assertEqual(ctx["outlook"], "Bullish")
+        self.assertEqual(ctx["state"], "active")
+        self.assertTrue(ctx["entry_ready"])
+
+    def test_derive_signal_context_marks_exit_state(self) -> None:
+        ctx = derive_signal_context("Exit PE", "Bearish", "Bearish", "Bearish", 71)
+        self.assertEqual(ctx["outlook"], "Bearish")
+        self.assertEqual(ctx["state"], "exit")
+        self.assertFalse(ctx["entry_ready"])
+
 
 if __name__ == "__main__":
     unittest.main()

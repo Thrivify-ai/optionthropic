@@ -17,6 +17,7 @@ from app.api.pro_routes import router as pro_router
 from app.api.routes import router as api_router
 from app.config import settings
 from app.data_ingestion.commodity_collector import run_commodity_collector
+from app.data_ingestion.global_news_collector import run_global_news_collector
 from app.data_ingestion.options_collector import run_collector
 from app.db.database import create_all_tables
 from app.logging_config import configure_logging, get_logger
@@ -80,17 +81,24 @@ async def lifespan(app: FastAPI):
     logger.info("Options collector started")
     commodity_task = asyncio.create_task(run_commodity_collector())
     logger.info("Commodity collector started")
+    global_news_task = asyncio.create_task(run_global_news_collector())
+    logger.info("Global news collector started")
 
     yield
 
     collector_task.cancel()
     commodity_task.cancel()
+    global_news_task.cancel()
     try:
         await collector_task
     except asyncio.CancelledError:
         pass
     try:
         await commodity_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await global_news_task
     except asyncio.CancelledError:
         pass
     if warmers_task is not None:

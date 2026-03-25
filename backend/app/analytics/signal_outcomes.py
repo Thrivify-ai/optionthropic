@@ -287,6 +287,36 @@ def serialize_outcome_row(row: SignalOutcome) -> dict[str, Any]:
     }
 
 
+def serialize_managed_trade_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "engine": row.engine,
+        "symbol": row.symbol,
+        "entry_signal": row.entry_signal,
+        "latest_signal": row.latest_signal,
+        "status": row.status,
+        "entry_confidence": int(row.entry_confidence or 0),
+        "latest_confidence": int(row.latest_confidence or 0),
+        "exit_confidence": int(row.exit_confidence) if row.exit_confidence is not None else None,
+        "entry_price": round(float(row.entry_price), 2) if row.entry_price is not None else None,
+        "latest_price": round(float(row.latest_price), 2) if row.latest_price is not None else None,
+        "latest_points": round(float(row.latest_points), 2) if row.latest_points is not None else None,
+        "success_threshold_points": round(float(row.success_threshold_points), 2) if row.success_threshold_points is not None else None,
+        "stop_points": round(float(row.stop_points), 2) if row.stop_points is not None else None,
+        "max_favorable_points": round(float(row.max_favorable_points), 2) if row.max_favorable_points is not None else None,
+        "max_adverse_points": round(float(row.max_adverse_points), 2) if row.max_adverse_points is not None else None,
+        "hold_cycles": int(row.hold_cycles or 0),
+        "exit_signal": row.exit_signal,
+        "exit_price": round(float(row.exit_price), 2) if row.exit_price is not None else None,
+        "realized_points": round(float(row.realized_points), 2) if row.realized_points is not None else None,
+        "result_label": row.result_label,
+        "entry_time": row.entry_time.isoformat() if row.entry_time else None,
+        "exit_time": row.exit_time.isoformat() if row.exit_time else None,
+        "entry_reason": row.entry_reason,
+        "exit_reason": row.exit_reason,
+    }
+
+
 async def build_signal_analytics_payload(
     session: AsyncSession,
     *,
@@ -294,6 +324,7 @@ async def build_signal_analytics_payload(
     limit: int = 200,
 ) -> dict[str, Any]:
     from sqlalchemy import desc, select
+    from app.models.managed_signal_trade import ManagedSignalTrade
     from app.models.signal_outcome import SignalOutcome
 
     await refresh_pending_signal_outcomes(session)
@@ -310,6 +341,17 @@ async def build_signal_analytics_payload(
 
     quick_rows = [row for row in rows if row.engine == "QUICK"]
     main_rows = [row for row in rows if row.engine == "MAIN"]
+
+    managed_rows = (
+        await session.execute(
+            select(ManagedSignalTrade)
+            .where(ManagedSignalTrade.entry_time >= cutoff)
+            .order_by(desc(ManagedSignalTrade.entry_time))
+            .limit(limit)
+        )
+    ).scalars().all()
+    managed_quick_rows = [row for row in managed_rows if row.engine == "QUICK"]
+    managed_main_rows = [row for row in managed_rows if row.engine == "MAIN"]
 
     quick_signals = [serialize_outcome_row(row) for row in quick_rows]
     long_signals = [serialize_outcome_row(row) for row in main_rows]
@@ -334,6 +376,31 @@ async def build_signal_analytics_payload(
     quick_decided = quick_won + quick_lost
     long_decided = long_won + long_lost
 
+    def _managed_summary(rows: list[Any]) -> dict[str, Any]:
+        won = sum(1 for row in rows if row.result_label == "Won")
+        lost = sum(1 for row in rows if row.result_label == "Lost")
+        scratch = sum(1 for row in rows if row.result_label == "Scratch")
+        open_count = sum(1 for row in rows if row.status == "OPEN")
+        decided = won + lost + scratch
+        avg_points = (
+            round(
+                sum(float(row.realized_points or 0) for row in rows if row.realized_points is not None)
+                / max(1, sum(1 for row in rows if row.realized_points is not None)),
+                1,
+            )
+            if any(row.realized_points is not None for row in rows)
+            else None
+        )
+        return {
+            "total": len(rows),
+            "won": won,
+            "lost": lost,
+            "scratch": scratch,
+            "open": open_count,
+            "win_rate_pct": round(100 * won / decided, 1) if decided > 0 else None,
+            "avg_realized_points": avg_points,
+        }
+
     return {
         "quick_signals": quick_signals,
         "long_signals": long_signals,
@@ -351,6 +418,10 @@ async def build_signal_analytics_payload(
             "unknown": long_unknown,
             "win_rate_pct": round(100 * long_won / long_decided, 1) if long_decided > 0 else None,
         },
+        "managed_quick_trades": [serialize_managed_trade_row(row) for row in managed_quick_rows],
+        "managed_long_trades": [serialize_managed_trade_row(row) for row in managed_main_rows],
+        "managed_quick_summary": _managed_summary(managed_quick_rows),
+        "managed_long_summary": _managed_summary(managed_main_rows),
         "quick_calibration": summarize_calibration(quick_states),
         "long_calibration": summarize_calibration(long_states),
         "days": days,

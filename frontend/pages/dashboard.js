@@ -1,26 +1,26 @@
 import { useState, useEffect, useCallback } from "react";
+import clsx from "clsx";
+
 import Layout from "../components/Layout";
 import { analyticsApi } from "../lib/api";
 import { isMarketOpen } from "../components/MarketTicker";
-import MarketBiasPanel   from "../components/MarketBiasPanel";
+import MarketBiasPanel from "../components/MarketBiasPanel";
 import TradeSignalsPanel from "../components/TradeSignalsPanel";
-import AIInsightsPanel   from "../components/AIInsightsPanel";
-import TimeFactorCard    from "../components/TimeFactorCard";
-import MarketTicker      from "../components/MarketTicker";
-import QuickSignalsCard  from "../components/QuickSignalsCard";
-import CommoditiesPanel  from "../components/CommoditiesPanel";
-import OptionsDashboard  from "../components/OptionsDashboard";
-import GammaWallChart    from "../components/GammaWallChart";
-import OptionsFlowPanel  from "../components/OptionsFlowPanel";
-import AlertsPanel       from "../components/AlertsPanel";
-import clsx from "clsx";
+import AIInsightsPanel from "../components/AIInsightsPanel";
+import TimeFactorCard from "../components/TimeFactorCard";
+import MarketTicker from "../components/MarketTicker";
+import CommoditiesPanel from "../components/CommoditiesPanel";
+import OptionsDashboard from "../components/OptionsDashboard";
+import GammaWallChart from "../components/GammaWallChart";
+import OptionsFlowPanel from "../components/OptionsFlowPanel";
+import AlertsPanel from "../components/AlertsPanel";
 
 const SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"];
-const TABS    = [
-  { id: "signals",  label: "Signals",   icon: "📊" },
-  { id: "deepdive", label: "Deep Dive", icon: "🔬" },
-  { id: "charts",   label: "Charts",    icon: "📈" },
-  { id: "commodities", label: "Commodities", icon: "🥇" },
+const TABS = [
+  { id: "signals", label: "Signals", icon: "SG" },
+  { id: "deepdive", label: "Deep Dive", icon: "DD" },
+  { id: "charts", label: "Charts", icon: "CH" },
+  { id: "commodities", label: "Commodities", icon: "CM" },
 ];
 
 function formatRelative(date) {
@@ -35,86 +35,80 @@ function formatRelative(date) {
 
 function SectionLabel({ number, title }) {
   return (
-    <div className="flex items-center gap-2 mb-2">
-      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-brand-600/90 text-white text-xs font-bold shadow-sm">
+    <div className="mb-2 flex items-center gap-2">
+      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-brand-600/90 text-xs font-bold text-white shadow-sm shadow-brand-500/20">
         {number}
       </span>
       <h3 className="text-sm font-semibold text-slate-200">{title}</h3>
-      <div className="flex-1 h-px bg-surface-border/80 ml-2" />
+      <div className="ml-2 h-px flex-1 bg-surface-border/80" />
     </div>
   );
 }
 
 export default function Dashboard() {
-  const [tab, setTab]                       = useState("signals");
-  const [symbol, setSymbol]                 = useState("NIFTY");
+  const [tab, setTab] = useState("signals");
+  const [symbol, setSymbol] = useState("NIFTY");
   const [lastDataUpdate, setLastDataUpdate] = useState(null);
   const [tickerLastUpdate, setTickerLastUpdate] = useState(null);
-  const [, setRelativeTick]                 = useState(0);
-  const [refreshTick, setRefreshTick]       = useState(0);
-  const [movementTick, setMovementTick]     = useState(0);
-  const [marketOpen, setMarketOpen]         = useState(isMarketOpen());
+  const [, setRelativeTick] = useState(0);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [movementTick, setMovementTick] = useState(0);
+  const [marketOpen, setMarketOpen] = useState(isMarketOpen());
 
-  // Never set "last updated" to the viewer's current time.
-  // Always use the DB-backed timestamp from /api/last-refresh.
   const onDataLoaded = useCallback(() => {
     analyticsApi.lastRefresh().then((data) => {
       if (data?.last_refresh_utc) setLastDataUpdate(new Date(data.last_refresh_utc));
     });
   }, []);
 
-  // General heartbeat:
-  // - Always updates marketOpen state.
-  // - Bumps refreshTick every 30 s during market hours for timely Trade Signals updates.
   useEffect(() => {
     const id = setInterval(() => {
-      const mo = isMarketOpen();
-      setMarketOpen(mo);
-      if (mo) setRefreshTick((t) => t + 1);
+      const open = isMarketOpen();
+      setMarketOpen(open);
+      if (open) setRefreshTick((tick) => tick + 1);
     }, 30_000);
     return () => clearInterval(id);
   }, []);
 
-  // Movement-driven tick — only check + bump when market is open
   useEffect(() => {
     const checkMovement = () => {
       if (!isMarketOpen()) return;
       Promise.all(
-        SYMBOLS.map((s) => analyticsApi.movement(s).catch(() => ({ movement_significant: false })))
+        SYMBOLS.map((item) =>
+          analyticsApi.movement(item).catch(() => ({ movement_significant: false }))
+        )
       ).then((results) => {
-        if (results.some((r) => r?.movement_significant)) {
-          setMovementTick((t) => t + 1);
+        if (results.some((item) => item?.movement_significant)) {
+          setMovementTick((tick) => tick + 1);
         }
       });
     };
+
     checkMovement();
     const id = setInterval(checkMovement, 60_000);
     return () => clearInterval(id);
   }, []);
 
-  // Last-refresh timestamp — always fetch on mount so "Closed at" shows the correct time.
-  // Interval polling only runs when market is open.
   useEffect(() => {
-    // Initial unconditional fetch — gives us the last-known data time even when closed
     analyticsApi.lastRefresh().then((data) => {
       if (data?.last_refresh_utc) setLastDataUpdate(new Date(data.last_refresh_utc));
     });
 
     const id = setInterval(() => {
-      if (!isMarketOpen()) return;          // stop calling after close
+      if (!isMarketOpen()) return;
       analyticsApi.lastRefresh().then((data) => {
         if (data?.last_refresh_utc) setLastDataUpdate(new Date(data.last_refresh_utc));
       });
     }, 30_000);
+
     return () => clearInterval(id);
   }, []);
 
   const displayUpdate = marketOpen && tickerLastUpdate ? tickerLastUpdate : lastDataUpdate;
 
-  // Relative-time label ticker — only runs while market is open; freezes on close
   useEffect(() => {
-    if (!displayUpdate || !marketOpen) return;
-    const id = setInterval(() => setRelativeTick((t) => t + 1), 10_000);
+    if (!displayUpdate || !marketOpen) return undefined;
+    const id = setInterval(() => setRelativeTick((tick) => tick + 1), 10_000);
     return () => clearInterval(id);
   }, [displayUpdate, marketOpen]);
 
@@ -126,63 +120,83 @@ export default function Dashboard() {
 
   return (
     <Layout subheader={<MarketTicker refreshTick={refreshTick} onTickerUpdate={setTickerLastUpdate} />}>
-      {/* ── Top bar ── */}
-      <div className="flex items-center justify-between mb-6 gap-4 flex-wrap">
-        <div>
-          <h2 className="font-bold text-slate-100 text-xl leading-none">Options Analytics</h2>
-          <p className="text-xs text-slate-500 mt-0.5">NSE · BSE derivatives · Real-time positioning</p>
-        </div>
+      <section className="surface-panel mb-6 rounded-[2rem] p-5">
+        <div className="flex flex-col gap-5">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div>
+              <p className="section-kicker">Core Workspace</p>
+              <h2 className="mt-2 text-3xl font-semibold leading-tight text-slate-100">
+                Options analytics, cleaned up for real decision-making.
+              </h2>
+              <p className="mt-3 max-w-3xl text-sm leading-relaxed text-slate-400">
+                Live market structure, disciplined trade signals, and AI-backed context for
+                NIFTY, BANKNIFTY, and SENSEX.
+              </p>
+            </div>
 
-        <div className="flex items-center gap-4 shrink-0 flex-wrap">
-          {/* Last updated pill */}
-          <div className="flex items-center gap-2 text-xs bg-surface-card/80 border border-surface-border rounded-lg px-3 py-1.5">
-            <span className={`inline-block h-2 w-2 rounded-full ${dotClass}`} title="Data status" />
-            <span className="text-slate-400">
-              {displayUpdate ? (
-                <>
-                  {marketOpen ? "Live" : "Closed at"}:{" "}
-                  <span className="text-slate-200 font-medium">
-                    {displayUpdate.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}
-                  </span>
-                  {/* Show relative time only while market is open */}
-                  {marketOpen && (
-                    <span className="ml-1 text-slate-500">({formatRelative(displayUpdate)})</span>
-                  )}
-                </>
-              ) : (
-                marketOpen ? "Fetching…" : "Market closed"
-              )}
-            </span>
+            <div className="flex flex-wrap gap-2">
+              <span className="stat-pill border-emerald-500/20 bg-emerald-500/10 text-emerald-300">
+                3 indices
+              </span>
+              <span className="stat-pill border-sky-500/20 bg-sky-500/10 text-sky-300">
+                Multi-timeframe
+              </span>
+              <span className="stat-pill border-white/10 text-slate-300">
+                Aurora Desk
+              </span>
+            </div>
           </div>
 
-          {/* Tab switcher */}
-          <div className="flex gap-1 bg-surface-card border border-surface-border rounded-xl p-1">
-            {TABS.map((t) => (
-              <button
-                key={t.id}
-                onClick={() => setTab(t.id)}
-                className={clsx(
-                  "flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-all",
-                  tab === t.id
-                    ? "bg-brand-600 text-white shadow"
-                    : "text-slate-400 hover:text-slate-100 hover:bg-white/5"
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+            <div className="flex items-center gap-2 rounded-2xl border border-surface-border bg-white/5 px-4 py-3 text-xs">
+              <span className={`inline-block h-2.5 w-2.5 rounded-full ${dotClass}`} title="Data status" />
+              <span className="text-slate-400">
+                {displayUpdate ? (
+                  <>
+                    {marketOpen ? "Live" : "Closed at"}{" "}
+                    <span className="font-semibold text-slate-100">
+                      {displayUpdate.toLocaleTimeString("en-IN", {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
+                    {marketOpen ? (
+                      <span className="ml-1 text-slate-500">({formatRelative(displayUpdate)})</span>
+                    ) : null}
+                  </>
+                ) : marketOpen ? (
+                  "Fetching..."
+                ) : (
+                  "Market closed"
                 )}
-              >
-                <span>{t.icon}</span>
-                {t.label}
-              </button>
-            ))}
+              </span>
+            </div>
+
+            <div className="flex flex-wrap gap-2 rounded-2xl border border-surface-border bg-white/5 p-1.5">
+              {TABS.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => setTab(item.id)}
+                  className={clsx(
+                    "flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition-all",
+                    tab === item.id
+                      ? "bg-brand-600 text-white shadow-lg shadow-brand-500/20"
+                      : "text-slate-400 hover:bg-white/5 hover:text-slate-100"
+                  )}
+                >
+                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-white/10 bg-white/5 text-[10px] font-semibold">
+                    {item.icon}
+                  </span>
+                  {item.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
-      </div>
+      </section>
 
-      {/* ══ TAB 1 — SIGNALS ══════════════════════════════════════════ */}
       {tab === "signals" && (
         <div className="space-y-8">
-          <div className="space-y-3">
-            <SectionLabel number="⚡" title="Quick Signals" />
-            <QuickSignalsCard />
-          </div>
           <div className="space-y-3">
             <SectionLabel number="1" title="Market Sentiment" />
             <MarketBiasPanel onDataLoaded={onDataLoaded} refreshTick={refreshTick} />
@@ -199,42 +213,40 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ══ TAB 2 — DEEP DIVE ════════════════════════════════════════ */}
       {tab === "deepdive" && (
         <div className="space-y-5">
           <div className="flex items-center gap-3">
-            <span className="text-xs text-slate-500 shrink-0">Select index:</span>
-            <div className="flex gap-1 bg-surface-card border border-surface-border rounded-lg p-1">
-              {SYMBOLS.map((s) => (
+            <span className="shrink-0 text-xs text-slate-500">Select index:</span>
+            <div className="flex gap-1 rounded-lg border border-surface-border bg-surface-card p-1">
+              {SYMBOLS.map((item) => (
                 <button
-                  key={s}
-                  onClick={() => setSymbol(s)}
+                  key={item}
+                  onClick={() => setSymbol(item)}
                   className={clsx(
-                    "px-4 py-1.5 rounded-md text-sm font-medium transition-all",
-                    symbol === s
-                      ? "bg-brand-600 text-white shadow-sm"
-                      : "text-slate-400 hover:text-slate-100 hover:bg-white/5"
+                    "rounded-md px-4 py-1.5 text-sm font-medium transition-all",
+                    symbol === item
+                      ? "bg-brand-600 text-white shadow-sm shadow-brand-500/20"
+                      : "text-slate-400 hover:bg-white/5 hover:text-slate-100"
                   )}
                 >
-                  {s}
+                  {item}
                 </button>
               ))}
             </div>
-            <div className="flex-1 h-px bg-surface-border" />
-            <span className="text-xs text-slate-500 shrink-0">Showing: {symbol}</span>
+            <div className="h-px flex-1 bg-surface-border" />
+            <span className="shrink-0 text-xs text-slate-500">Showing: {symbol}</span>
           </div>
 
           <OptionsDashboard symbol={symbol} onDataLoaded={onDataLoaded} refreshTick={refreshTick} />
-          <GammaWallChart   symbol={symbol} onDataLoaded={onDataLoaded} refreshTick={refreshTick} />
+          <GammaWallChart symbol={symbol} onDataLoaded={onDataLoaded} refreshTick={refreshTick} />
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
             <OptionsFlowPanel symbol={symbol} onDataLoaded={onDataLoaded} refreshTick={refreshTick} />
-            <AlertsPanel      symbol={symbol} />
+            <AlertsPanel symbol={symbol} />
           </div>
         </div>
       )}
 
-      {/* ══ TAB 4 — COMMODITIES ═══════════════════════════════════════ */}
       {tab === "commodities" && (
         <div className="space-y-5">
           <div className="space-y-3">
@@ -242,34 +254,34 @@ export default function Dashboard() {
             <CommoditiesPanel />
           </div>
           <p className="text-[10px] text-slate-600">
-            Signals are futures-based (price/momentum/timeframe alignment). Refreshes every 15 s.
+            Signals are futures-based with price, momentum, and timeframe alignment. Refreshes every 15s.
           </p>
         </div>
       )}
-      {/* ══ TAB 3 — CHARTS (coming soon) ════════════════════════════ */}
+
       {tab === "charts" && (
-        <div className="flex flex-col items-center justify-center py-24 gap-6">
-          <span className="text-6xl opacity-30">📈</span>
+        <div className="flex flex-col items-center justify-center gap-6 py-24">
+          <span className="text-6xl opacity-30">/</span>
           <div className="text-center">
-            <h3 className="text-xl font-bold text-slate-300 mb-2">Charts — Coming Soon</h3>
-            <p className="text-sm text-slate-500 max-w-md leading-relaxed">
-              TradingView index charts for NIFTY · BANKNIFTY · SENSEX, plus
-              proprietary analytics charts powered by our own data.
+            <h3 className="mb-2 text-xl font-bold text-slate-300">Charts - Coming Soon</h3>
+            <p className="max-w-md text-sm leading-relaxed text-slate-500">
+              TradingView index charts for NIFTY, BANKNIFTY, and SENSEX, plus proprietary analytics
+              charts powered by our own data.
             </p>
           </div>
-          <div className="flex flex-wrap justify-center gap-2 mt-1">
+          <div className="mt-1 flex flex-wrap justify-center gap-2">
             {[
               "Index Candlesticks",
               "PCR Over Time",
               "OI Distribution",
               "OI Buildup Heatmap",
               "Volume Profile",
-            ].map((f) => (
+            ].map((item) => (
               <span
-                key={f}
-                className="text-[11px] text-slate-500 bg-surface-card border border-surface-border rounded-lg px-3 py-1.5"
+                key={item}
+                className="rounded-lg border border-surface-border bg-surface-card px-3 py-1.5 text-[11px] text-slate-500"
               >
-                {f}
+                {item}
               </span>
             ))}
           </div>

@@ -37,6 +37,7 @@ from app.analytics.signal_outcomes import (
     refresh_pending_signal_outcomes,
 )
 from app.analytics.signal_engine import Bias, Signal, TradingSignal
+from app.analytics.trade_manager import apply_managed_trade_decision
 from app.config import settings
 from app.db.database import AsyncSessionLocal
 from app.logging_config import get_logger
@@ -440,26 +441,6 @@ async def run_signal_engine_cycle() -> None:
                     )
                 ).scalars().first()
 
-                row = TradingSignalRow(
-                    symbol=symbol,
-                    signal=ts.signal.value,
-                    confidence=ts.confidence,
-                    support=ts.support,
-                    resistance=ts.resistance,
-                    bias_5m=ts.bias_5m.value,
-                    bias_30m=ts.bias_30m.value,
-                    bias_60m=ts.bias_60m.value,
-                    reason=ts.reason,
-                )
-                session.add(row)
-
-                context = derive_signal_context(
-                    ts.signal.value,
-                    ts.bias_5m.value,
-                    ts.bias_30m.value,
-                    ts.bias_60m.value,
-                    int(ts.confidence),
-                )
                 generated_at = datetime.now(timezone.utc)
                 entry_price = None
                 if f5_views:
@@ -470,6 +451,66 @@ async def run_signal_engine_cycle() -> None:
                     entry_price = float(snap30["current_price"])
                 elif sentiment.get("spot"):
                     entry_price = float(sentiment["spot"])
+
+                managed_hard_exit = False
+                managed_hard_exit_reason = None
+                if f5_views and f30_views and f60_views:
+                    current_f5 = f5_views[0]
+                    current_f30 = f30_views[0]
+                    current_f60 = f60_views[0]
+                    if any(
+                        feature.trap_warning_flag
+                        for feature in (current_f5, current_f30, current_f60)
+                    ):
+                        managed_hard_exit = True
+                        managed_hard_exit_reason = "Higher-timeframe trap risk is confirmed. Exit the active trade."
+                    elif (
+                        current_f30.price_rangebound
+                        and current_f60.price_rangebound
+                        and int(ts.confidence) < 45
+                    ):
+                        managed_hard_exit = True
+                        managed_hard_exit_reason = "30m and 60m both slipped back into rangebound conditions."
+
+                managed_decision, _managed_trade_row = await apply_managed_trade_decision(
+                    session,
+                    engine="MAIN",
+                    symbol=symbol,
+                    base_signal=ts.signal.value,
+                    confidence=int(ts.confidence),
+                    current_price=entry_price,
+                    reason=ts.reason,
+                    now_utc=generated_at,
+                    hard_exit=managed_hard_exit,
+                    hard_exit_reason=managed_hard_exit_reason,
+                )
+                public_signal = managed_decision.public_signal
+                public_reason = (
+                    managed_decision.management_reason
+                    if managed_decision.action in {"hold", "exit"}
+                    else ts.reason
+                )
+
+                row = TradingSignalRow(
+                    symbol=symbol,
+                    signal=public_signal,
+                    confidence=ts.confidence,
+                    support=ts.support,
+                    resistance=ts.resistance,
+                    bias_5m=ts.bias_5m.value,
+                    bias_30m=ts.bias_30m.value,
+                    bias_60m=ts.bias_60m.value,
+                    reason=public_reason,
+                )
+                session.add(row)
+
+                context = derive_signal_context(
+                    public_signal,
+                    ts.bias_5m.value,
+                    ts.bias_30m.value,
+                    ts.bias_60m.value,
+                    int(ts.confidence),
+                )
 
                 breakout = False
                 breakdown = False
@@ -514,7 +555,7 @@ async def run_signal_engine_cycle() -> None:
                     session,
                     symbol=symbol,
                     engine="MAIN",
-                    signal=ts.signal.value,
+                    signal=public_signal,
                     entry_time=generated_at,
                     current_price=entry_price,
                     support=ts.support,
@@ -540,10 +581,10 @@ async def run_signal_engine_cycle() -> None:
                     signal_version="main_v2_live",
                     mode="LIVE",
                     symbol=symbol,
-                    signal=ts.signal.value,
+                    signal=public_signal,
                     confidence=int(ts.confidence),
                     generated_at=generated_at,
-                    reason=ts.reason,
+                    reason=public_reason,
                     context=quant_context,
                     outlook=str(context["outlook"]),
                     state=str(context["state"]),
@@ -551,7 +592,7 @@ async def run_signal_engine_cycle() -> None:
                 )
                 shadow_signal, shadow_confidence, shadow_reason = derive_shadow_signal(
                     engine="MAIN",
-                    signal=ts.signal.value,
+                    signal=public_signal,
                     confidence=int(ts.confidence),
                     context=quant_context,
                     entry_ready=bool(context["entry_ready"]),
@@ -573,19 +614,19 @@ async def run_signal_engine_cycle() -> None:
                 )
                 signal_changed = (
                     latest_existing is None
-                    or latest_existing.signal != ts.signal.value
+                    or latest_existing.signal != public_signal
                 )
-                if ts.signal.value in ("Buy CE", "Buy PE") and signal_changed:
+                if managed_decision.action == "entry" and public_signal in ("Buy CE", "Buy PE") and signal_changed:
                     if entry_price is not None and entry_price > 0:
                         await record_signal_outcome_candidate(
                             session,
                             engine="MAIN",
                             symbol=symbol,
-                            signal=ts.signal.value,
+                            signal=public_signal,
                             confidence=int(ts.confidence),
                             entry_price=entry_price,
                             entry_time=generated_at,
-                            reason=ts.reason,
+                            reason=public_reason,
                             outlook=str(context["outlook"]),
                             state=str(context["state"]),
                         )
@@ -594,11 +635,11 @@ async def run_signal_engine_cycle() -> None:
                             engine="MAIN",
                             signal_version="main_v2_live",
                             symbol=symbol,
-                            signal=ts.signal.value,
+                            signal=public_signal,
                             confidence=int(ts.confidence),
                             entry_time=generated_at,
                             underlying_entry_price=entry_price,
-                            reason=ts.reason,
+                            reason=public_reason,
                             context=quant_context,
                             outlook=str(context["outlook"]),
                             state=str(context["state"]),
@@ -625,7 +666,7 @@ async def run_signal_engine_cycle() -> None:
                 logger.info(
                     "signal_generated",
                     symbol=symbol,
-                    signal=ts.signal.value,
+                    signal=public_signal,
                     confidence=ts.confidence,
                     sentiment=sentiment["bias"].value,
                     pcr_oi=round(sentiment["pcr_oi"], 3),

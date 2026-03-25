@@ -28,6 +28,7 @@ from app.analytics.quant_signal_capture import (
 )
 from app.analytics.quick_signal import get_quick_signal
 from app.analytics.quick_signal_engine import run_quick_signal_engine
+from app.analytics.trade_manager import get_latest_trade_row, get_open_trade_row, serialize_trade_summary
 from app.analytics.mcx_prices import get_mcx_prices
 from app.analytics.commodity_signals import commodity_quick_signal, commodity_long_term_signal
 from app.analytics.commodity_insights import get_commodity_insights
@@ -346,11 +347,17 @@ async def get_trading_signal(
     )
     row = (await session.execute(stmt)).scalars().first()
     if not row:
-        payload = serialize_trading_signal_payload(None)
+        trade_row = await get_open_trade_row(session, engine="MAIN", symbol=symbol)
+        if trade_row is None:
+            trade_row = await get_latest_trade_row(session, engine="MAIN", symbol=symbol)
+        payload = serialize_trading_signal_payload(None, serialize_trade_summary(trade_row))
         payload["symbol"] = symbol
         return payload
 
-    payload = serialize_trading_signal_payload(row)
+    trade_row = await get_open_trade_row(session, engine="MAIN", symbol=symbol)
+    if trade_row is None:
+        trade_row = await get_latest_trade_row(session, engine="MAIN", symbol=symbol)
+    payload = serialize_trading_signal_payload(row, serialize_trade_summary(trade_row))
     payload["symbol"] = row.symbol
     return payload
 

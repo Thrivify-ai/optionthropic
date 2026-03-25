@@ -1,7 +1,9 @@
 """
-Background polling service — runs every POLL_INTERVAL_SECONDS seconds.
-Fetches full option chain for each supported symbol, persists raw snapshots
-to RDS, and publishes a lightweight update event to SQS.
+Background polling service for live option-chain collection.
+
+This collector now has two responsibilities:
+- run a once-per-trading-day startup recovery check to bootstrap stale data
+- fetch live option-chain updates only while the Indian market is open
 """
 
 from __future__ import annotations
@@ -12,28 +14,25 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alerts.alert_engine import run_all_symbols
 from app.analytics.dashboard_cache import refresh_dashboard_snapshot_cache
 from app.analytics.feature_builder import run_feature_snapshot_cycle
 from app.analytics.signal_runner import run_signal_engine_cycle
 from app.config import settings
+from app.data_ingestion.data_recovery import run_startup_recovery_cycle
 from app.data_ingestion.data_source_router import get_data_source
+from app.data_ingestion.snapshot_store import persist_chain_snapshots
 from app.db.database import AsyncSessionLocal
 from app.logging_config import get_logger
-from app.models.chain_snapshot import ChainSnapshot
-from app.models.options_snapshot import OptionsSnapshot
-from app.services.market_hours import should_refresh_intraday_caches
+from app.services.market_hours import current_trading_date, should_refresh_intraday_caches
 
 logger = get_logger(__name__)
+
 
 def _is_market_open() -> bool:
     """Return True when the Indian cash market session is open."""
     return should_refresh_intraday_caches()
-
-
-# ─── SQS publisher ─────────────────────────────────────────────────────────────
 
 
 def _get_sqs_client():
@@ -62,140 +61,98 @@ async def _publish_sqs_event(symbol: str, underlying_price: float) -> None:
         await loop.run_in_executor(
             None,
             lambda: client.send_message(
-                QueueUrl=settings.sqs_queue_url, MessageBody=message
+                QueueUrl=settings.sqs_queue_url,
+                MessageBody=message,
             ),
         )
     except (BotoCoreError, ClientError) as exc:
         logger.warning("SQS publish failed", symbol=symbol, error=str(exc))
 
 
-# ─── Persistence helpers ────────────────────────────────────────────────────────
+async def _run_post_collection_jobs() -> None:
+    try:
+        await run_all_symbols()
+    except Exception as exc:
+        logger.warning("Alert evaluation failed (will retry next cycle)", error=str(exc))
+
+    try:
+        await run_signal_engine_cycle()
+    except Exception as exc:
+        logger.warning("Signal engine failed (will retry next cycle)", error=str(exc))
+
+    try:
+        await refresh_dashboard_snapshot_cache()
+    except Exception as exc:
+        logger.warning("Dashboard snapshot cache refresh failed (will retry next cycle)", error=str(exc))
 
 
-async def _persist_snapshots(
-    session: AsyncSession, symbol: str, records: list[dict]
-) -> None:
-    now = datetime.now(timezone.utc)
-    snapshots = []
-    chain_map: dict[tuple, dict] = {}
-
-    for r in records:
-        snapshots.append(
-            OptionsSnapshot(
-                symbol=r["symbol"],
-                strike=r["strike"],
-                expiry=r["expiry"],
-                option_type=r["option_type"],
-                oi=r["oi"],
-                volume=r["volume"],
-                last_price=r["last_price"],
-                underlying_price=r["underlying_price"],
-                timestamp=now,
-            )
-        )
-
-        key = (r["strike"], r["expiry"])
-        if key not in chain_map:
-            chain_map[key] = {
-                "symbol": symbol,
-                "strike": r["strike"],
-                "expiry": r["expiry"],
-                "call_oi": 0,
-                "put_oi": 0,
-                "call_volume": 0,
-                "put_volume": 0,
-                "underlying_price": r["underlying_price"],
-                "timestamp": now,
-            }
-        if r["option_type"] == "CE":
-            chain_map[key]["call_oi"] += r["oi"]
-            chain_map[key]["call_volume"] += r["volume"]
-        else:
-            chain_map[key]["put_oi"] += r["oi"]
-            chain_map[key]["put_volume"] += r["volume"]
-
-    session.add_all(snapshots)
-    for data in chain_map.values():
-        session.add(ChainSnapshot(**data))
-
-    await session.flush()
-
-
-# ─── Poll loop ─────────────────────────────────────────────────────────────────
-
-
-async def _collect_symbol(symbol: str) -> None:
+async def _collect_symbol(symbol: str) -> bool:
     source = get_data_source()
     logger.info("Fetching option chain", symbol=symbol)
 
     records = await source.fetch_option_chain(symbol)
     if not records:
         logger.warning("Empty chain response", symbol=symbol)
-        return
+        return False
 
-    underlying = records[0]["underlying_price"] if records else 0.0
+    underlying = float(records[0].get("underlying_price") or 0.0)
 
     async with AsyncSessionLocal() as session:
-        await _persist_snapshots(session, symbol, records)
-        if underlying:
-            await run_feature_snapshot_cycle(session, symbol, datetime.now(timezone.utc), float(underlying))
+        persisted_at = await persist_chain_snapshots(session, symbol, records)
+        if underlying and persisted_at is not None:
+            await run_feature_snapshot_cycle(session, symbol, persisted_at, underlying)
         await session.commit()
 
     logger.info("Persisted snapshots", symbol=symbol, count=len(records))
     await _publish_sqs_event(symbol, underlying)
+    return True
 
 
 async def run_collector() -> None:
-    """Entry point — runs forever, polling every POLL_INTERVAL_SECONDS.
-    Symbols are collected sequentially with a 3s gap to avoid Zerodha rate limits.
-    Never raises; failures are logged and retried next cycle."""
+    """Run forever, polling at the configured interval."""
     logger.info(
         "Options collector started",
         interval=settings.poll_interval_seconds,
         symbols=settings.supported_symbols,
     )
 
+    last_recovery_date = None
+
     while True:
-        # NSE returns last trading day's data 24/7 — always fetch. Zerodha/Angel only when market open.
-        should_fetch = (
-            _is_market_open()
-            or settings.data_source == "NSE"
-        )
-        if should_fetch:
+        boot_date = current_trading_date()
+        recovery_triggered = False
+
+        if boot_date != last_recovery_date:
             try:
-                for sym in settings.supported_symbols:
+                recovery_result = await run_startup_recovery_cycle()
+                logger.info("Startup recovery checked", **recovery_result)
+                recovery_triggered = recovery_result.get("status") == "completed"
+            except Exception as exc:
+                logger.warning("Startup recovery check failed", error=str(exc))
+            last_recovery_date = boot_date
+
+        live_cycle_had_updates = False
+        if _is_market_open():
+            try:
+                for symbol in settings.supported_symbols:
                     try:
-                        await _collect_symbol(sym)
+                        live_cycle_had_updates = await _collect_symbol(symbol) or live_cycle_had_updates
                     except Exception as exc:
                         logger.warning(
                             "Collector cycle error (will retry)",
-                            symbol=sym,
+                            symbol=symbol,
                             error=str(exc),
                         )
-                    # 3-second gap between symbols to respect Zerodha rate limits
                     await asyncio.sleep(3)
             except Exception as exc:
                 logger.warning("Collector outer error (will retry)", error=str(exc))
-
-            # Run alert and signal evaluation on latest data
-            try:
-                await run_all_symbols()
-            except Exception as exc:
-                logger.warning("Alert evaluation failed (will retry next cycle)", error=str(exc))
-
-            try:
-                await run_signal_engine_cycle()
-            except Exception as exc:
-                logger.warning("Signal engine failed (will retry next cycle)", error=str(exc))
-
-            try:
-                await refresh_dashboard_snapshot_cache()
-            except Exception as exc:
-                logger.warning("Dashboard snapshot cache refresh failed (will retry next cycle)", error=str(exc))
         else:
             logger.info(
-                "Market closed — skipping fetch",
+                "Market closed - skipping live fetch",
                 data_source=settings.data_source,
             )
+
+        if recovery_triggered or live_cycle_had_updates:
+            await _run_post_collection_jobs()
 
         await asyncio.sleep(settings.poll_interval_seconds)

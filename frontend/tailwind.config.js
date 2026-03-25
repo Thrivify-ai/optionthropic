@@ -9,13 +9,13 @@ module.exports = {
     extend: {
       colors: {
         brand: {
-          50:  "#eef2ff",
-          100: "#e0e7ff",
-          400: "#818cf8",
-          500: "#6366f1",
-          600: "#4f46e5",
-          700: "#4338ca",
-          900: "#312e81",
+          50: "#edfffa",
+          100: "#cdfaf0",
+          400: "#52e6c4",
+          500: "#21d1a5",
+          600: "#12b48b",
+          700: "#0b8e6d",
+          900: "#07392d",
         },
         surface: {
           DEFAULT: "var(--color-surface)",
@@ -24,7 +24,7 @@ module.exports = {
         },
       },
       fontFamily: {
-        sans: ["Inter", "system-ui", "sans-serif"],
+        sans: ["Manrope", "system-ui", "sans-serif"],
         mono: ["JetBrains Mono", "monospace"],
       },
     },

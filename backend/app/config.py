@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     ai_cache_ttl_market_closed_seconds: int = 21600
     bedrock_model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0"
     bedrock_region: str = "ap-south-1"
+    global_news_enabled: bool = True
+    global_news_poll_market_open_seconds: int = 300
+    global_news_poll_market_closed_seconds: int = 3600
+    global_news_cache_ttl_market_open_seconds: int = 300
+    global_news_cache_ttl_market_closed_seconds: int = 21600
+    global_news_lookback_hours: int = 36
+    global_news_limit: int = 10
+    global_news_timeout_seconds: int = 8
+    global_news_rss_urls: list[str] = [
+        "https://news.google.com/rss/search?q=(Federal%20Reserve%20OR%20FOMC%20OR%20inflation%20OR%20CPI%20OR%20payrolls%20OR%20bond%20yields%20OR%20rate%20cut%20OR%20rate%20hike)&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=(oil%20OR%20crude%20OR%20OPEC%20OR%20Middle%20East%20OR%20sanctions%20OR%20tariff%20OR%20war)&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=(RBI%20OR%20rupee%20OR%20USDINR%20OR%20China%20stimulus%20OR%20Asia%20markets%20OR%20India%20markets)&hl=en-IN&gl=IN&ceid=IN:en",
+    ]
 
     # Shared cache
     redis_url: str = ""

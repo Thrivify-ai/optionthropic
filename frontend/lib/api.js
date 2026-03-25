@@ -71,6 +71,9 @@ export const analyticsApi = {
   /** Fetch buy signal history for Quick Signals. */
   buySignalHistory: (symbol) =>
     api.get("/api/buy-signal-history", { params: symbol ? { symbol } : {} }).then((r) => r.data?.history ?? []).catch(() => []),
+  /** Global market-moving news alerts. Returns critical feed items only. */
+  globalNewsAlerts: () =>
+    api.get("/api/pro/global-alerts").then((r) => r.data).catch(() => ({ alerts: [], generated_at: null, cached: false })),
   /** No auth required. Returns { token_set, token_valid, bfo_sensex_instruments, message }. */
   zerodhaStatus: () =>
     api.get("/api/zerodha-status").then((r) => r.data).catch(() => ({ token_set: false, token_valid: false, message: "Could not reach backend" })),

@@ -56,8 +56,12 @@ async def create_all_tables() -> None:
         signal_outcome,
         quant_signal_outcome,
         signal_shadow_decision,
+        global_news_alert,
         dashboard_snapshot_cache,
         market_summary_cache,
+        collector_heartbeat,
+        data_gap_event,
+        managed_signal_trade,
     )
 
     async with engine.begin() as conn:

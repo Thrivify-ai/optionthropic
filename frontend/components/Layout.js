@@ -1,46 +1,24 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/router";
-import { clearSession, getStoredUser, isAuthenticated } from "../lib/auth";
 import clsx from "clsx";
+
+import { clearSession, getStoredUser, isAuthenticated } from "../lib/auth";
+import ThemeToggleButton from "./ThemeToggleButton";
 
 const NAV = [
   { href: "/dashboard", label: "Dashboard" },
-  { href: "/pro-signals", label: "Pro Signals" },
-  { href: "/alerts",    label: "Alerts"    },
-  { href: "/profile",   label: "Profile"   },
-  { href: "/settings",  label: "Settings"  },
+  { href: "/pro-signals", label: "Pro Desk" },
+  { href: "/alerts", label: "Alerts" },
+  { href: "/profile", label: "Profile" },
+  { href: "/settings", label: "Settings" },
 ];
+
 const ADMIN_NAV = [{ href: "/admin/analytics", label: "Signal Analytics" }];
-
-function SunIcon() {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <circle cx="12" cy="12" r="5"/>
-      <line x1="12" y1="1"  x2="12" y2="3"/>
-      <line x1="12" y1="21" x2="12" y2="23"/>
-      <line x1="4.22" y1="4.22"  x2="5.64" y2="5.64"/>
-      <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
-      <line x1="1"  y1="12" x2="3"  y2="12"/>
-      <line x1="21" y1="12" x2="23" y2="12"/>
-      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
-      <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
-    </svg>
-  );
-}
-
-function MoonIcon() {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-    </svg>
-  );
-}
 
 export default function Layout({ children, subheader }) {
   const router = useRouter();
-  const [user, setUser]       = useState(null);
-  const [theme, setTheme]     = useState("dark"); // start dark, load from LS on mount
+  const [user, setUser] = useState(null);
 
   useEffect(() => {
     if (!isAuthenticated()) {
@@ -48,92 +26,93 @@ export default function Layout({ children, subheader }) {
       return;
     }
     setUser(getStoredUser());
-  }, []);
-
-  // Load persisted theme once on mount and apply to <html>
-  useEffect(() => {
-    const saved = localStorage.getItem("ot-theme") || "dark";
-    applyTheme(saved);
-    setTheme(saved);
-  }, []);
-
-  function applyTheme(t) {
-    const html = document.documentElement;
-    if (t === "light") {
-      html.classList.add("light");
-      html.classList.remove("dark");
-    } else {
-      html.classList.add("dark");
-      html.classList.remove("light");
-    }
-  }
-
-  function toggleTheme() {
-    const next = theme === "dark" ? "light" : "dark";
-    applyTheme(next);
-    setTheme(next);
-    localStorage.setItem("ot-theme", next);
-  }
+  }, [router]);
 
   const logout = () => {
     clearSession();
     router.push("/login");
   };
 
-  const isDark = theme === "dark";
-
   return (
-    <div className="min-h-screen flex flex-col">
-      <header className="border-b border-surface-border bg-surface-card/60 backdrop-blur sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
-          <Link href="/dashboard" className="flex items-center gap-2">
-            <span className="h-7 w-7 rounded-lg bg-brand-600 flex items-center justify-center text-white font-bold text-sm">
+    <div className="app-shell flex min-h-screen flex-col">
+      <div className="app-backdrop" />
+
+      <header
+        className="sticky top-0 z-40 border-b backdrop-blur-xl"
+        style={{
+          backgroundColor: "var(--color-header-surface)",
+          borderColor: "var(--color-surface-border)",
+        }}
+      >
+        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6">
+          <Link href="/dashboard" className="group flex items-center gap-3">
+            <span
+              className="flex h-10 w-10 items-center justify-center rounded-2xl text-sm font-extrabold shadow-lg"
+              style={{
+                backgroundImage: "linear-gradient(135deg, var(--color-brand), var(--color-secondary))",
+                color: "#04131c",
+              }}
+            >
               OT
             </span>
-            <span className="font-bold text-slate-100 tracking-tight">
-              Optionthropic
-            </span>
+            <div className="leading-tight">
+              <span className="section-kicker block">Aurora Desk</span>
+              <span className="block text-sm font-semibold text-slate-100 transition-colors group-hover:text-brand-300">
+                Optionthropic
+              </span>
+            </div>
           </Link>
 
-          <nav className="hidden md:flex items-center gap-1">
+          <nav className="hidden items-center gap-1 rounded-2xl border border-white/10 bg-white/5 p-1 md:flex">
             {NAV.map(({ href, label }) => (
-              <Link key={href} href={href} className={clsx("px-3 py-1.5 rounded-lg text-sm transition-colors", router.pathname === href ? "bg-brand-600/20 text-brand-400" : "text-slate-400 hover:text-slate-100 hover:bg-white/5")}>
+              <Link
+                key={href}
+                href={href}
+                className={clsx(
+                  "nav-pill",
+                  router.pathname === href
+                    ? "bg-brand-600/20 text-brand-300 shadow-sm"
+                    : "text-slate-400 hover:bg-white/5 hover:text-slate-100"
+                )}
+              >
                 {label}
               </Link>
             ))}
-            {user?.is_admin && ADMIN_NAV.map(({ href, label }) => (
-              <Link key={href} href={href} className={clsx("px-3 py-1.5 rounded-lg text-sm transition-colors border border-amber-500/30", router.pathname === href ? "bg-amber-500/20 text-amber-400" : "text-amber-600 hover:text-amber-400 hover:bg-amber-500/10")}>
-                {label}
-              </Link>
-            ))}
+            {user?.is_admin &&
+              ADMIN_NAV.map(({ href, label }) => (
+                <Link
+                  key={href}
+                  href={href}
+                  className={clsx(
+                    "nav-pill border",
+                    router.pathname === href
+                      ? "border-amber-400/30 bg-amber-400/15 text-amber-300"
+                      : "border-amber-500/20 text-amber-400 hover:bg-amber-500/10"
+                  )}
+                >
+                  {label}
+                </Link>
+              ))}
           </nav>
 
           <div className="flex items-center gap-2">
-            {user && (
-              <span className="text-xs text-slate-500 hidden sm:block">
-                {user.email}
-                {user.is_admin && (
-                  <span className="ml-1.5 badge-yellow">Admin</span>
-                )}
-                {!user.is_admin && (
-                  <span className="ml-1.5 badge-blue">{user.plan}</span>
-                )}
-              </span>
-            )}
+            {user ? (
+              <div className="hidden rounded-2xl border border-white/10 bg-white/5 px-3 py-2 sm:block">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">
+                  Signed in
+                </p>
+                <div className="mt-1 flex items-center gap-2">
+                  <span className="text-xs text-slate-300">{user.email}</span>
+                  {user.is_admin ? (
+                    <span className="badge-yellow">Admin</span>
+                  ) : (
+                    <span className="badge-blue">{user.plan}</span>
+                  )}
+                </div>
+              </div>
+            ) : null}
 
-            {/* Theme toggle */}
-            <button
-              onClick={toggleTheme}
-              title={isDark ? "Switch to light mode" : "Switch to dark mode"}
-              className={clsx(
-                "flex items-center justify-center h-8 w-8 rounded-lg border transition-colors duration-200",
-                isDark
-                  ? "border-slate-600 text-slate-400 hover:text-amber-300 hover:border-amber-400/50 hover:bg-amber-400/5"
-                  : "border-slate-300 text-slate-500 hover:text-brand-600 hover:border-brand-400/50 hover:bg-brand-400/5"
-              )}
-            >
-              {isDark ? <SunIcon /> : <MoonIcon />}
-            </button>
+            <ThemeToggleButton />
 
             <button onClick={logout} className="btn-ghost text-sm">
               Sign out
@@ -142,15 +121,14 @@ export default function Layout({ children, subheader }) {
         </div>
       </header>
 
-      {subheader && <div className="w-full">{subheader}</div>}
+      {subheader ? <div className="relative z-10 w-full">{subheader}</div> : null}
 
-      <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6">
+      <main className="relative z-10 mx-auto flex-1 w-full max-w-7xl px-4 py-6 sm:px-6">
         {children}
       </main>
 
-      <footer className="border-t border-surface-border text-center py-4 text-xs text-slate-600">
-        Optionthropic © {new Date().getFullYear()} · For informational purposes only.
-        Not investment advice.
+      <footer className="relative z-10 border-t border-surface-border/80 px-4 py-4 text-center text-xs text-slate-500">
+        Optionthropic {new Date().getFullYear()} - Signals, structure, and discipline.
       </footer>
     </div>
   );

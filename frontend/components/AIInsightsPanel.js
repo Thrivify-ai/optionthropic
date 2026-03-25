@@ -1,79 +1,65 @@
-/**
- * Section 3 — AI Market Summaries
- * Shows AI-generated market insights for all 3 indices simultaneously.
- */
 import { useEffect, useState } from "react";
-import { analyticsApi } from "../lib/api";
 import clsx from "clsx";
+
+import { analyticsApi } from "../lib/api";
 
 const SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"];
 
 const SYMBOL_META = {
-  NIFTY:     { label: "NIFTY 50",    color: "text-brand-400",   border: "border-brand-500/30",   bg: "from-brand-900/20"     },
-  BANKNIFTY: { label: "BANK NIFTY",  color: "text-purple-400",  border: "border-purple-500/30",  bg: "from-purple-900/20"    },
-  SENSEX:    { label: "BSE SENSEX",  color: "text-orange-400",  border: "border-orange-500/30",  bg: "from-orange-900/20"    },
+  NIFTY: { label: "NIFTY 50", accent: "text-brand-300", border: "border-brand-500/20", glow: "from-brand-500/10" },
+  BANKNIFTY: { label: "BANK NIFTY", accent: "text-sky-300", border: "border-sky-500/20", glow: "from-sky-500/10" },
+  SENSEX: { label: "BSE SENSEX", accent: "text-amber-300", border: "border-amber-500/20", glow: "from-amber-500/10" },
 };
 
 function InsightCard({ symbol, data, loading, error, deferMs = 0 }) {
-  const [ready, setReady]  = useState(!deferMs);
+  const [ready, setReady] = useState(!deferMs);
   const meta = SYMBOL_META[symbol] || SYMBOL_META.NIFTY;
 
   useEffect(() => {
-    if (deferMs > 0) {
-      const t = setTimeout(() => setReady(true), deferMs);
-      return () => clearTimeout(t);
-    } else {
+    if (deferMs <= 0) {
       setReady(true);
+      return undefined;
     }
+
+    const timer = setTimeout(() => setReady(true), deferMs);
+    return () => clearTimeout(timer);
   }, [deferMs]);
 
   if (!ready) {
-    return (
-      <div className={clsx(
-        "card border bg-gradient-to-br to-surface-card min-h-[180px] animate-pulse shadow-lg shadow-black/20",
-        meta.border, meta.bg
-      )} />
-    );
+    return <div className={clsx("card min-h-[210px] animate-pulse border bg-gradient-to-br to-surface-card", meta.border, meta.glow)} />;
   }
 
   return (
-    <div className={clsx(
-      "card border bg-gradient-to-br to-surface-card flex flex-col gap-3 min-h-[180px] shadow-lg shadow-black/20",
-      meta.border, meta.bg
-    )}>
-      {/* Header */}
-      <div className="flex items-center gap-2">
-        <span className={clsx(
-          "flex h-7 w-7 items-center justify-center rounded-lg text-[10px] font-black shrink-0",
-          "bg-white/10", meta.color
-        )}>
-          AI
-        </span>
-        <div>
-          <p className={clsx("text-xs font-bold uppercase tracking-wider", meta.color)}>
-            {meta.label}
-          </p>
-          {data?.cached && (
-            <span className="text-[9px] text-slate-500">(cached result)</span>
-          )}
+    <div className={clsx("card flex min-h-[210px] flex-col gap-3 border bg-gradient-to-br to-surface-card", meta.border, meta.glow)}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <span className={clsx("flex h-9 w-9 items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-xs font-bold", meta.accent)}>
+            AI
+          </span>
+          <div>
+            <p className="section-kicker">Desk Note</p>
+            <h4 className={clsx("mt-1 text-sm font-semibold", meta.accent)}>{meta.label}</h4>
+          </div>
         </div>
+        {data?.cached ? (
+          <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-300">
+            Cached
+          </span>
+        ) : null}
       </div>
 
-      {/* Content */}
-      {loading && (
-        <div className="flex-1 flex flex-col gap-2 animate-pulse">
-          <div className="h-3 bg-white/5 rounded w-full" />
-          <div className="h-3 bg-white/5 rounded w-5/6" />
-          <div className="h-3 bg-white/5 rounded w-4/6" />
-          <p className="text-xs text-slate-500 mt-1">Generating AI insight…</p>
+      {loading ? (
+        <div className="flex flex-1 flex-col gap-2 animate-pulse">
+          <div className="h-3 w-full rounded bg-white/5" />
+          <div className="h-3 w-5/6 rounded bg-white/5" />
+          <div className="h-3 w-3/4 rounded bg-white/5" />
+          <p className="mt-2 text-xs text-slate-500">Generating AI insight...</p>
         </div>
-      )}
-      {error && (
-        <p className="text-xs text-slate-500 flex-1">{error}</p>
-      )}
-      {!loading && !error && (
-        <p className="text-sm text-slate-200 leading-relaxed flex-1">
-          {data?.insight || "No AI insight available. Ensure data is flowing from Zerodha."}
+      ) : error ? (
+        <p className="flex-1 text-sm text-slate-500">{error}</p>
+      ) : (
+        <p className="flex-1 text-sm leading-relaxed text-slate-200">
+          {data?.insight || "No AI insight available yet. Once data and cache are ready, the desk note will appear here."}
         </p>
       )}
     </div>
@@ -86,41 +72,48 @@ export default function AIInsightsPanel({ onDataLoaded, refreshTick }) {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    const first = Object.keys(overview).length === 0;
+    const firstLoad = Object.keys(overview).length === 0;
     let retryTimer = null;
-    if (first) setLoading(true);
+
+    if (firstLoad) setLoading(true);
     setError(null);
-    analyticsApi.dashboardOverview()
+
+    analyticsApi
+      .dashboardOverview()
       .then((data) => {
         const symbols = data?.symbols || {};
         setOverview(symbols);
         onDataLoaded?.();
+
         if (Object.values(symbols).some((entry) => entry?.ai_summary?.pending)) {
           retryTimer = setTimeout(() => {
-            analyticsApi.dashboardOverview().then((nextData) => {
-              setOverview(nextData?.symbols || {});
-            }).catch(() => {});
+            analyticsApi
+              .dashboardOverview()
+              .then((nextData) => setOverview(nextData?.symbols || {}))
+              .catch(() => {});
           }, 8000);
         }
       })
       .catch(() => setError("AI insight unavailable"))
-      .finally(() => { if (first) setLoading(false); });
+      .finally(() => {
+        if (firstLoad) setLoading(false);
+      });
+
     return () => {
       if (retryTimer) clearTimeout(retryTimer);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshTick]);
+  }, [refreshTick, onDataLoaded]);
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-      {SYMBOLS.map((s, i) => (
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+      {SYMBOLS.map((symbol, index) => (
         <InsightCard
-          key={s}
-          symbol={s}
-          data={overview[s]?.ai_summary}
+          key={symbol}
+          symbol={symbol}
+          data={overview[symbol]?.ai_summary}
           loading={loading}
           error={error}
-          deferMs={i * 500}
+          deferMs={index * 350}
         />
       ))}
     </div>
