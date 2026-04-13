@@ -97,7 +97,14 @@ function ConfidenceBar({ confidence }) {
   );
 }
 
-function SignalCard({ symbol, data, loading, error }) {
+function formatFreshness(seconds) {
+  if (!Number.isFinite(seconds)) return "-";
+  if (seconds < 60) return `${seconds}s`;
+  const mins = Math.floor(seconds / 60);
+  return `${mins}m`;
+}
+
+function SignalCard({ symbol, data, breadth, loading, error }) {
   if (loading) {
     return (
       <div className="card min-h-[300px] animate-pulse">
@@ -135,6 +142,10 @@ function SignalCard({ symbol, data, loading, error }) {
   const latestPoints = Number.isFinite(trade?.latest_points) ? trade.latest_points : null;
   const successThreshold = Number.isFinite(trade?.success_threshold_points) ? trade.success_threshold_points : null;
   const stopPoints = Number.isFinite(trade?.stop_points) ? trade.stop_points : null;
+  const breadthScore = Number.isFinite(breadth?.breadth_score) ? breadth.breadth_score : null;
+  const generatedAt = data?.generated_at ? new Date(data.generated_at) : null;
+  const freshnessSeconds = Number.isFinite(data?.freshness_seconds) ? data.freshness_seconds : null;
+  const stale = Boolean(data?.stale);
 
   const stateStyle =
     state === "active"
@@ -180,6 +191,25 @@ function SignalCard({ symbol, data, loading, error }) {
         <div className="mt-3">
           <ConfidenceBar confidence={confidence} />
         </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {generatedAt ? (
+            <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-300">
+              As of {generatedAt.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })}
+            </span>
+          ) : null}
+          {freshnessSeconds != null ? (
+            <span
+              className={clsx(
+                "rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em]",
+                stale
+                  ? "border-amber-500/25 bg-amber-500/10 text-amber-300"
+                  : "border-emerald-500/25 bg-emerald-500/10 text-emerald-300"
+              )}
+            >
+              Fresh {formatFreshness(freshnessSeconds)}
+            </span>
+          ) : null}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-2">
@@ -209,6 +239,12 @@ function SignalCard({ symbol, data, loading, error }) {
       <div className="rounded-[1.25rem] border border-surface-border bg-white/5 p-3">
         <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Signal Reason</p>
         <p className="mt-2 text-sm leading-relaxed text-slate-300">{data?.reason || "Awaiting cleaner alignment."}</p>
+        {breadth?.available ? (
+          <p className="mt-2 text-[11px] text-slate-500">
+            Internal breadth {breadthScore > 0 ? "+" : ""}
+            {breadthScore}: {breadth?.reason}
+          </p>
+        ) : null}
       </div>
 
       {(entryPrice || latestPoints != null || successThreshold != null || stopPoints != null) ? (
@@ -237,6 +273,7 @@ function SignalCard({ symbol, data, loading, error }) {
 
 export default function TradeSignalsPanel({ refreshTick }) {
   const [overview, setOverview] = useState({});
+  const [breadthBySymbol, setBreadthBySymbol] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -245,9 +282,18 @@ export default function TradeSignalsPanel({ refreshTick }) {
     if (firstLoad) setLoading(true);
     setError(null);
 
-    analyticsApi
-      .dashboardOverview()
-      .then((data) => setOverview(data?.symbols || {}))
+    Promise.all([
+      analyticsApi.dashboardOverview(),
+      Promise.all(SYMBOLS.map((symbol) => analyticsApi.indexBreadth(symbol))),
+    ])
+      .then(([data, breadthRows]) => {
+        setOverview(data?.symbols || {});
+        const nextBreadth = {};
+        breadthRows.forEach((row, index) => {
+          nextBreadth[SYMBOLS[index]] = row;
+        });
+        setBreadthBySymbol(nextBreadth);
+      })
       .catch(() => setError("Signal unavailable"))
       .finally(() => {
         if (firstLoad) setLoading(false);
@@ -261,6 +307,7 @@ export default function TradeSignalsPanel({ refreshTick }) {
           key={symbol}
           symbol={symbol}
           data={overview[symbol]?.trading_signal}
+          breadth={breadthBySymbol[symbol]}
           loading={loading}
           error={error}
         />

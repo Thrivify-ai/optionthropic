@@ -17,7 +17,7 @@ from app.analytics.liquidity_trap_detection import detect_liquidity_traps
 from app.analytics.max_pain_detection import compute_max_pain
 from app.analytics.options_analysis import compute_pcr, compute_support_resistance
 from app.analytics.options_flow_detection import detect_options_flow
-from app.analytics.quick_signal import get_quick_signal
+from app.analytics.quick_signal_cache import get_cached_quick_signal_payload
 from app.analytics.trade_manager import get_latest_trade_row, get_open_trade_row, serialize_trade_summary
 from app.config import settings
 from app.db.database import AsyncSessionLocal
@@ -35,7 +35,14 @@ async def build_dashboard_snapshot_for_symbol(session: AsyncSession, symbol: str
     max_pain = await compute_max_pain(session, symbol)
     traps = await detect_liquidity_traps(session, symbol)
     flow = await detect_options_flow(session, symbol, top_n=20)
-    quick_signal = await get_quick_signal(session, symbol)
+    quick_signal = await get_cached_quick_signal_payload(symbol, max_age_seconds=max(20, settings.quick_signal_poll_seconds * 2))
+    if quick_signal is None:
+        quick_signal = {
+            "symbol": symbol,
+            "quick_signal": "Wait",
+            "state": "idle",
+            "reason": "Quick collector has not produced a fresh state yet.",
+        }
     support_resistance = await compute_support_resistance(session, symbol)
     trading_row = (
         await session.execute(

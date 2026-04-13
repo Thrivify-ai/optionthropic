@@ -17,9 +17,13 @@ class QuickSignalSessionProfile:
     name: str
     threshold_multiplier: float
     min_confidence: int
+    min_confirmation_count: int
     confirm_cycles: int
     min_hold_seconds: int
     cooldown_seconds: int
+    allow_soft_entries: bool = False
+    requires_breakout: bool = False
+    min_breadth_score: int = 0
 
 
 @dataclass
@@ -33,6 +37,9 @@ class QuickSignalLifecycleState:
     cooldown_until: str | None = None
     confidence: int = 0
     last_data_key: str | None = None
+    reversal_signal: str | None = None
+    reversal_count: int = 0
+    reversal_last_seen_at: str | None = None
 
 
 def session_profile_for(now_utc: datetime | None = None) -> QuickSignalSessionProfile:
@@ -42,16 +49,16 @@ def session_profile_for(now_utc: datetime | None = None) -> QuickSignalSessionPr
     now_ist = current.astimezone(timezone(timedelta(hours=5, minutes=30)))
 
     if now_ist.weekday() > 4:
-        return QuickSignalSessionProfile("closed", 1.35, 90, 99, 0, 0)
+        return QuickSignalSessionProfile("closed", 1.35, 90, 5, 99, 0, 0, False, True, 40)
 
     t = now_ist.time()
-    if dtime(9, 0) <= t < dtime(10, 15):
-        return QuickSignalSessionProfile("opening", 1.10, 76, 2, 120, 90)
-    if dtime(10, 15) <= t < dtime(13, 30):
-        return QuickSignalSessionProfile("midday", 1.25, 82, 3, 150, 120)
-    if dtime(13, 30) <= t <= dtime(15, 30):
-        return QuickSignalSessionProfile("closing", 1.12, 78, 2, 120, 90)
-    return QuickSignalSessionProfile("closed", 1.35, 90, 99, 0, 0)
+    if dtime(9, 15) <= t < dtime(10, 30):
+        return QuickSignalSessionProfile("opening", 1.04, 83, 4, 2, 90, 60, True, False, 14)
+    if dtime(10, 30) <= t < dtime(13, 45):
+        return QuickSignalSessionProfile("midday", 1.30, 90, 5, 2, 120, 90, False, True, 24)
+    if dtime(13, 45) <= t <= dtime(15, 30):
+        return QuickSignalSessionProfile("closing", 1.08, 84, 4, 2, 90, 60, True, False, 12)
+    return QuickSignalSessionProfile("closed", 1.35, 90, 5, 99, 0, 0, False, True, 40)
 
 
 def adjusted_threshold(value: float, profile: QuickSignalSessionProfile) -> float:
@@ -68,10 +75,16 @@ def reward_risk_ok(
     breakout: bool,
     breakdown: bool,
 ) -> tuple[bool, str]:
-    required_headroom = max(target_move * 0.4, spot * 0.0015)
+    required_headroom = max(target_move * 0.5, spot * 0.0015)
+    allowed_extension = max(target_move * 0.25, spot * 0.0006)
     if signal == "Buy CE":
         if breakout:
-            return True, "Breakout cleared near resistance"
+            if resistance is None:
+                return True, "Breakout cleared the prior resistance"
+            extension = spot - resistance
+            if extension <= allowed_extension:
+                return True, f"Breakout is still within {extension:.0f} pts of resistance"
+            return False, f"Breakout is already extended {extension:.0f} pts above resistance"
         if resistance is None:
             return True, "No nearby resistance wall"
         headroom = resistance - spot
@@ -81,7 +94,12 @@ def reward_risk_ok(
 
     if signal == "Buy PE":
         if breakdown:
-            return True, "Breakdown cleared near support"
+            if support is None:
+                return True, "Breakdown cleared the prior support"
+            extension = support - spot
+            if extension <= allowed_extension:
+                return True, f"Breakdown is still within {extension:.0f} pts of support"
+            return False, f"Breakdown is already extended {extension:.0f} pts below support"
         if support is None:
             return True, "No nearby support wall"
         headroom = spot - support
@@ -103,9 +121,17 @@ def quick_signal_confidence(
     volume_spike: bool,
     oi_confirmed: bool,
     persistent: bool,
+    confirmation_count: int,
+    fresh_data: bool,
     trap: bool,
     rangebound: bool,
     risk_reward_ok: bool,
+    breadth_aligned: bool,
+    breadth_score: int,
+    short_covering_risk: int,
+    volatility_ratio: float | None,
+    session_name: str,
+    regime_blocked: bool = False,
 ) -> int:
     if not bullish and not bearish:
         return 0
@@ -122,16 +148,41 @@ def quick_signal_confidence(
     if oi_confirmed:
         score += 12
     if persistent:
-        score += 12
+        score += 14
     if risk_reward_ok:
+        score += 12
+    if breadth_aligned:
         score += 10
+    score += min(8, max(0, int(abs(breadth_score) / 8)))
+    score += min(max(confirmation_count, 0), 4) * 4
+    if fresh_data:
+        score += 4
+    if volatility_ratio is not None:
+        if 0.9 <= volatility_ratio <= 1.85:
+            score += 6
+        elif volatility_ratio < 0.75:
+            score -= 8
 
     if trap:
-        score -= 35
+        score -= 38
     if rangebound:
-        score -= 25
+        score -= 28
     if not risk_reward_ok:
-        score -= 20
+        score -= 18
+    if not breadth_aligned and breadth_score != 0:
+        score -= 16
+    if short_covering_risk >= 70:
+        score -= 24
+    elif short_covering_risk >= 50:
+        score -= 12
+    if confirmation_count < 2:
+        score -= 16
+    if not fresh_data:
+        score -= 8
+    if session_name == "midday":
+        score -= 8
+    if regime_blocked:
+        score -= 24
 
     return max(0, min(100, score))
 
@@ -149,6 +200,9 @@ def parse_lifecycle_state(payload: dict[str, Any] | None) -> QuickSignalLifecycl
         cooldown_until=payload.get("cooldown_until"),
         confidence=int(payload.get("confidence", 0) or 0),
         last_data_key=payload.get("last_data_key"),
+        reversal_signal=payload.get("reversal_signal"),
+        reversal_count=int(payload.get("reversal_count", 0) or 0),
+        reversal_last_seen_at=payload.get("reversal_last_seen_at"),
     )
 
 
@@ -190,6 +244,9 @@ def apply_lifecycle(
         cooldown_until=previous.cooldown_until,
         confidence=previous.confidence,
         last_data_key=previous.last_data_key,
+        reversal_signal=previous.reversal_signal,
+        reversal_count=previous.reversal_count,
+        reversal_last_seen_at=previous.reversal_last_seen_at,
     )
 
     activated_at = _parse_ts(state.activated_at)
@@ -203,6 +260,9 @@ def apply_lifecycle(
         state.candidate_signal = None
         state.candidate_count = 0
         state.active_signal = None
+        state.reversal_signal = None
+        state.reversal_count = 0
+        state.reversal_last_seen_at = None
         state.cooldown_until = (now_utc + timedelta(seconds=profile.cooldown_seconds)).isoformat()
         state.confidence = confidence
         state.last_data_key = data_key
@@ -220,6 +280,9 @@ def apply_lifecycle(
         state.active_signal = None
         state.candidate_signal = None
         state.candidate_count = 0
+        state.reversal_signal = None
+        state.reversal_count = 0
+        state.reversal_last_seen_at = None
         state.confidence = confidence
         state.last_data_key = data_key
         return state, {
@@ -237,6 +300,9 @@ def apply_lifecycle(
             state.last_seen_at = now_iso
             state.confidence = confidence
             state.last_data_key = data_key or state.last_data_key
+            state.reversal_signal = None
+            state.reversal_count = 0
+            state.reversal_last_seen_at = None
             return state, {
                 "quick_signal": state.active_signal,
                 "state": "active",
@@ -250,6 +316,9 @@ def apply_lifecycle(
             state.state = "active"
             state.confidence = max(state.confidence, confidence)
             state.last_data_key = data_key or state.last_data_key
+            state.reversal_signal = None
+            state.reversal_count = 0
+            state.reversal_last_seen_at = None
             return state, {
                 "quick_signal": state.active_signal,
                 "state": "active",
@@ -262,6 +331,9 @@ def apply_lifecycle(
         if raw_signal in BUY_SIGNALS and raw_signal != state.active_signal and active_age < profile.min_hold_seconds:
             state.state = "active"
             state.last_data_key = data_key or state.last_data_key
+            state.reversal_signal = None
+            state.reversal_count = 0
+            state.reversal_last_seen_at = None
             return state, {
                 "quick_signal": state.active_signal,
                 "state": "active",
@@ -271,20 +343,48 @@ def apply_lifecycle(
                 "state_reason": "Opposite direction appeared, but the current active signal is still inside its minimum hold window.",
             }
 
+        reversal_signal = raw_signal if raw_signal in BUY_SIGNALS else "Wait"
+        fresh_market_data = state.last_data_key != data_key
+        if state.reversal_signal == reversal_signal and fresh_market_data:
+            state.reversal_count += 1
+        elif state.reversal_signal != reversal_signal:
+            state.reversal_signal = reversal_signal
+            state.reversal_count = 1
+        state.reversal_last_seen_at = now_iso
+        state.last_data_key = data_key or state.last_data_key
+        state.confidence = confidence
+
+        required_reversal_cycles = 1 if fast_track else 2
+        if state.reversal_count < required_reversal_cycles:
+            pending_reason = (
+                "Opposite direction appeared; waiting for one more confirming cycle before exiting."
+                if reversal_signal in BUY_SIGNALS
+                else "Follow-through paused; waiting for one more cycle before closing the active trade."
+            )
+            return state, {
+                "quick_signal": state.active_signal,
+                "state": "active",
+                "stability_cycles": max(required_cycles, state.candidate_count),
+                "active_age_seconds": active_age,
+                "cooldown_seconds_remaining": 0,
+                "state_reason": pending_reason,
+            }
+
         state.state = "cooldown"
         state.candidate_signal = raw_signal if raw_signal in BUY_SIGNALS else None
         state.candidate_count = 1 if raw_signal in BUY_SIGNALS else 0
         state.active_signal = None
+        state.reversal_signal = None
+        state.reversal_count = 0
+        state.reversal_last_seen_at = None
         state.cooldown_until = (now_utc + timedelta(seconds=profile.cooldown_seconds)).isoformat()
-        state.confidence = confidence
-        state.last_data_key = data_key
         return state, {
             "quick_signal": "Wait",
             "state": "cooldown",
             "stability_cycles": 0,
             "active_age_seconds": active_age,
             "cooldown_seconds_remaining": profile.cooldown_seconds,
-            "state_reason": "Active signal ended and has moved into cooldown.",
+            "state_reason": "Active signal ended after reversal/weakening persisted across two cycles.",
         }
 
     if raw_signal in BUY_SIGNALS:
@@ -299,6 +399,9 @@ def apply_lifecycle(
         state.confidence = confidence
         state.last_seen_at = now_iso
         state.last_data_key = data_key
+        state.reversal_signal = None
+        state.reversal_count = 0
+        state.reversal_last_seen_at = None
 
         if not fresh_market_data and state.candidate_count < required_cycles:
             return state, {
@@ -342,6 +445,9 @@ def apply_lifecycle(
     state.cooldown_until = None
     state.confidence = confidence
     state.last_data_key = data_key
+    state.reversal_signal = None
+    state.reversal_count = 0
+    state.reversal_last_seen_at = None
     return state, {
         "quick_signal": "Wait",
         "state": "idle",

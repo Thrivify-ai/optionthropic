@@ -1,14 +1,14 @@
 /**
- * Pro Commodities - dashboard-style cards per commodity with signals and news context.
+ * Pro commodities desk with cleaner setup vs active language.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import clsx from "clsx";
 
-import { analyticsApi } from "../lib/api";
 import { proApi } from "../lib/proApi";
+import { analyticsApi } from "../lib/api";
 
 const COMMODITIES = ["CRUDEOIL", "NATGAS", "GOLD", "SILVER"];
-const POLL_MS = 15000;
+const POLL_MS = 15_000;
 
 const LABELS = {
   CRUDEOIL: "Crude Oil",
@@ -18,16 +18,13 @@ const LABELS = {
 };
 
 const META = {
-  LONG: { label: "LONG", icon: "▲", desc: "Bullish bias", color: "text-emerald-400", bg: "bg-emerald-500/15", border: "border-emerald-500/40" },
-  SHORT: { label: "SHORT", icon: "▼", desc: "Bearish bias", color: "text-red-400", bg: "bg-red-500/15", border: "border-red-500/40" },
-  WAIT: { label: "WAIT", icon: "◆", desc: "No clear direction", color: "text-slate-400", bg: "bg-slate-500/10", border: "border-slate-500/20" },
-};
-
-const NEWS_KEYWORDS = {
-  CRUDEOIL: ["oil", "crude", "brent", "opec", "refinery"],
-  NATGAS: ["natural gas", "natgas", "lng", "gas supply"],
-  GOLD: ["gold", "bullion", "safe haven", "treasury yield", "bond yield", "inflation"],
-  SILVER: ["silver", "precious metals", "bullion", "inflation", "safe haven"],
+  LONG: { label: "LONG", icon: "▲", color: "text-emerald-400", bg: "bg-emerald-500/15", border: "border-emerald-500/40" },
+  SHORT: { label: "SHORT", icon: "▼", color: "text-red-400", bg: "bg-red-500/15", border: "border-red-500/40" },
+  "HOLD LONG": { label: "HOLD LONG", icon: "HL", color: "text-cyan-300", bg: "bg-cyan-500/15", border: "border-cyan-500/40" },
+  "HOLD SHORT": { label: "HOLD SHORT", icon: "HS", color: "text-cyan-300", bg: "bg-cyan-500/15", border: "border-cyan-500/40" },
+  "EXIT LONG": { label: "EXIT LONG", icon: "XL", color: "text-amber-300", bg: "bg-amber-500/15", border: "border-amber-500/40" },
+  "EXIT SHORT": { label: "EXIT SHORT", icon: "XS", color: "text-amber-300", bg: "bg-amber-500/15", border: "border-amber-500/40" },
+  WAIT: { label: "WAIT", icon: "◆", color: "text-slate-400", bg: "bg-slate-500/10", border: "border-slate-500/20" },
 };
 
 function normalizeNumber(value, decimals = 2) {
@@ -38,28 +35,6 @@ function normalizeNumber(value, decimals = 2) {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
-}
-
-function extractAffected(alert) {
-  if (Array.isArray(alert?.affected_symbols)) return alert.affected_symbols;
-  if (Array.isArray(alert?.symbols)) return alert.symbols;
-  return [];
-}
-
-function alertMatchesCommodity(symbol, alert) {
-  const affected = extractAffected(alert);
-  if (affected.includes(symbol)) return true;
-
-  const haystack = `${alert?.title || ""} ${alert?.summary || ""} ${alert?.impact_reason || ""}`.toLowerCase();
-  return (NEWS_KEYWORDS[symbol] || []).some((keyword) => haystack.includes(keyword));
-}
-
-function buildCommodityInsight(symbol, alerts) {
-  const relevant = (alerts || [])
-    .filter((alert) => alertMatchesCommodity(symbol, alert))
-    .sort((a, b) => Number(b?.impact_score || 0) - Number(a?.impact_score || 0));
-
-  return relevant[0] || null;
 }
 
 function NewsImpactPill({ score }) {
@@ -78,69 +53,141 @@ function NewsImpactPill({ score }) {
   );
 }
 
-function CommodityCard({ symbol, data, newsAlert, loading }) {
-  const d = data || {};
-  const price = d.price ?? null;
-  const change = d.change ?? 0;
-  const changePct = d.change_pct ?? null;
-  const quickSig = (d.quick_signal || "WAIT").trim();
-  const longSig = (d.long_signal || "WAIT").trim();
+function VolatilityPill({ ratio }) {
+  const numeric = Number(ratio || 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return (
+    <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] font-mono font-semibold text-slate-300">
+      Vol x{numeric.toFixed(2)}
+    </span>
+  );
+}
+
+function TradeLine({ trade, points, win, stop }) {
+  const latestPoints = trade?.latest_points ?? points;
+  const success = trade?.success_threshold_points ?? win;
+  const stopPoints = trade?.stop_points ?? stop;
+  const entry = trade?.entry_price;
+  if (latestPoints == null && success == null && stopPoints == null && entry == null) return null;
+
+  const numericPoints = Number(latestPoints ?? 0);
+  return (
+    <p className="mt-1 font-mono text-[10px] leading-snug text-slate-500">
+      {entry != null ? `Entry ${normalizeNumber(entry)} · ` : ""}
+      {latestPoints != null ? `Pts ${numericPoints >= 0 ? "+" : ""}${normalizeNumber(numericPoints)} · ` : ""}
+      Win {success != null ? `+${normalizeNumber(success)}` : "-"} · Stop {stopPoints != null ? `-${normalizeNumber(stopPoints)}` : "-"}
+    </p>
+  );
+}
+
+function SetupPill({ state, direction, count, required }) {
+  if (state !== "setup" || !direction) return null;
+  return (
+    <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-mono font-semibold text-amber-300">
+      {direction} setup {count ?? 0}/{required ?? "?"}
+    </span>
+  );
+}
+
+function CommodityCard({ symbol, data, loading }) {
+  const payload = data || {};
+  const price = payload.price ?? null;
+  const change = payload.change ?? 0;
+  const changePct = payload.change_pct ?? null;
+  const quickSig = (payload.quick_signal || "WAIT").trim();
+  const longSig = (payload.long_signal || "WAIT").trim();
   const qMeta = META[quickSig] || META.WAIT;
   const lMeta = META[longSig] || META.WAIT;
   const up = change > 0;
   const down = change < 0;
   const primarySig = quickSig !== "WAIT" ? quickSig : longSig;
   const primaryMeta = META[primarySig] || META.WAIT;
+  const newsAlert = payload.news_alert || null;
 
   return (
-    <div className={clsx("card border flex flex-col gap-4 shadow-lg shadow-black/20 transition-all duration-200 hover:-translate-y-1 hover:shadow-2xl", primaryMeta.border)}>
-      <div className="flex items-start justify-between">
+    <div
+      className={clsx(
+        "card flex flex-col gap-4 border shadow-lg shadow-black/20 transition-all duration-200 hover:-translate-y-1 hover:shadow-2xl",
+        primaryMeta.border
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
         <div>
-          <p className="text-xs text-slate-500 uppercase tracking-widest font-semibold mb-0.5">{LABELS[symbol] || symbol}</p>
-          <p className="text-xl font-bold font-mono text-slate-100 leading-none">
+          <p className="mb-0.5 text-xs font-semibold uppercase tracking-widest text-slate-500">{LABELS[symbol] || symbol}</p>
+          <p className="text-xl font-bold font-mono leading-none text-slate-100">
             {loading ? "…" : price != null ? normalizeNumber(price) : "—"}
           </p>
-          <p className={clsx("text-xs mt-1 font-mono", up ? "text-emerald-400" : down ? "text-red-400" : "text-slate-500")}>
+          <p className={clsx("mt-1 text-xs font-mono", up ? "text-emerald-400" : down ? "text-red-400" : "text-slate-500")}>
             {loading ? "" : changePct != null ? `${change >= 0 ? "+" : ""}${normalizeNumber(change)} (${changePct >= 0 ? "+" : ""}${changePct}%)` : "—"}
           </p>
         </div>
-        <div className="flex flex-col items-end gap-1">
-          <div className="flex gap-1">
-            <span className={clsx("text-[10px] px-2 py-0.5 rounded font-bold", qMeta.bg, qMeta.color)}>Quick {qMeta.icon}</span>
-            <span className={clsx("text-[10px] px-2 py-0.5 rounded font-bold", lMeta.bg, lMeta.color)}>Long {lMeta.icon}</span>
+
+        <div className="flex flex-col items-end gap-1.5">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wider text-slate-500">Quick</span>
+            <span className={clsx("rounded px-2 py-0.5 text-[10px] font-bold", qMeta.bg, qMeta.color)}>
+              {qMeta.icon}
+            </span>
+            <span className="text-[10px] font-mono text-slate-400">{payload.quick_confidence ?? 0}%</span>
           </div>
-          {newsAlert ? <NewsImpactPill score={newsAlert.impact_score} /> : null}
+          <SetupPill
+            state={payload.quick_state}
+            direction={payload.quick_setup_direction}
+            count={payload.quick_confirmation_count}
+            required={payload.quick_required_confirmations}
+          />
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wider text-slate-500">Long</span>
+            <span className={clsx("rounded px-2 py-0.5 text-[10px] font-bold", lMeta.bg, lMeta.color)}>
+              {lMeta.icon}
+            </span>
+            <span className="text-[10px] font-mono text-slate-400">{payload.long_confidence ?? 0}%</span>
+          </div>
+          <SetupPill
+            state={payload.long_state}
+            direction={payload.long_setup_direction}
+            count={payload.long_confirmation_count}
+            required={payload.long_required_confirmations}
+          />
+          {newsAlert ? <NewsImpactPill score={payload.news_impact_score} /> : null}
+          <VolatilityPill ratio={payload.quick_volatility_ratio || payload.long_volatility_ratio} />
         </div>
       </div>
 
-      <div className="rounded-lg border border-surface-border/50 px-3 py-2 flex flex-col gap-1.5">
-        <p className="text-[11px] text-slate-300 leading-snug font-medium">
-          {d.explanation || "No data yet."}
+      <div className="rounded-lg border border-surface-border/50 px-3 py-2">
+        <p className="text-[11px] font-medium leading-snug text-slate-300">
+          {payload.explanation || "No data yet."}
         </p>
-        {d.quick_reason && quickSig !== "WAIT" && (
-          <p className="text-[10px] text-slate-500">Quick: {d.quick_reason}</p>
-        )}
-        {d.long_reason && longSig !== "WAIT" && (
-          <p className="text-[10px] text-slate-500">Long: {d.long_reason}</p>
-        )}
+        {payload.quick_reason ? <p className="mt-1 text-[10px] text-slate-500">Quick: {payload.quick_reason}</p> : null}
+        <TradeLine
+          trade={payload.quick_trade}
+          points={payload.quick_current_points}
+          win={payload.quick_success_threshold_points}
+          stop={payload.quick_stop_points}
+        />
+        {payload.long_reason ? <p className="mt-1 text-[10px] text-slate-500">Long: {payload.long_reason}</p> : null}
+        <TradeLine
+          trade={payload.long_trade}
+          points={payload.long_current_points}
+          win={payload.long_success_threshold_points}
+          stop={payload.long_stop_points}
+        />
       </div>
 
-      <div className="rounded-lg border border-surface-border/50 bg-surface/20 px-3 py-2 flex flex-col gap-1.5">
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">News insight</p>
-          <span className="text-[10px] text-slate-500">
-            {newsAlert?.source || "No critical news"}
-          </span>
+      <div className="rounded-lg border border-surface-border/50 bg-surface/20 px-3 py-2">
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">News insight</p>
+          <span className="text-[10px] text-slate-500">{payload.news_source || "No critical news"}</span>
         </div>
         {newsAlert ? (
           <>
-            <p className="text-xs text-slate-200 leading-snug">{newsAlert.title}</p>
-            <p className="text-[10px] text-slate-400 leading-snug">
-              {newsAlert.impact_reason || newsAlert.summary || "High-impact global cue tracked for this commodity."}
+            <p className="text-xs leading-snug text-slate-200">{payload.news_title || newsAlert.title}</p>
+            <p className="text-[10px] leading-snug text-slate-400">
+              {payload.news_reason || newsAlert.impact_reason || newsAlert.summary || "High-impact global cue tracked for this commodity."}
             </p>
           </>
         ) : (
-          <p className="text-xs text-slate-500 leading-snug">
+          <p className="text-xs leading-snug text-slate-500">
             No critical world-news trigger is currently elevating risk for this commodity.
           </p>
         )}
@@ -151,62 +198,64 @@ function CommodityCard({ symbol, data, newsAlert, loading }) {
 
 export default function ProCommodities() {
   const [data, setData] = useState({});
-  const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [marketStatus, setMarketStatus] = useState(null);
 
   useEffect(() => {
     let alive = true;
 
     const fetchData = () => {
-      Promise.all([
-        proApi.commodities().catch(() => ({})),
-        analyticsApi.globalNewsAlerts().catch(() => ({ alerts: [] })),
-      ])
-        .then(([commodities, alertsPayload]) => {
+      proApi
+        .commodities()
+        .then((commodities) => {
           if (!alive) return;
           setData(commodities || {});
-          setAlerts(Array.isArray(alertsPayload?.alerts) ? alertsPayload.alerts : []);
           setLoading(false);
         })
         .catch(() => {
           if (!alive) return;
           setData({});
-          setAlerts([]);
           setLoading(false);
         });
     };
 
+    const fetchStatus = () =>
+      analyticsApi
+        .marketStatus()
+        .then((status) => {
+          if (alive) setMarketStatus(status);
+          return Boolean(status?.mcx?.is_open);
+        })
+        .catch(() => false);
+
     fetchData();
-    const id = setInterval(fetchData, POLL_MS);
+    fetchStatus();
+    const id = setInterval(async () => {
+      const mcxOpen = await fetchStatus();
+      if (mcxOpen) fetchData();
+    }, POLL_MS);
     return () => {
       alive = false;
       clearInterval(id);
     };
   }, []);
 
-  const alertMap = useMemo(() => {
-    const next = {};
-    for (const symbol of COMMODITIES) {
-      next[symbol] = buildCommodityInsight(symbol, alerts);
-    }
-    return next;
-  }, [alerts]);
+  const mcxOpen = Boolean(marketStatus?.mcx?.is_open);
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2">
-        <span className="text-sm font-bold text-slate-100">Commodities Desk</span>
-        <span className="text-[10px] text-slate-500">MCX prices · Quick + long signals · News-driven insight · 15s refresh</span>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-bold text-slate-100">Commodities Desk</span>
+          <span className="text-[10px] text-slate-500">MCX prices · managed quick and long reads · news context</span>
+        </div>
+        <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-300">
+          {mcxOpen ? "MCX live · 15s refresh" : `${marketStatus?.mcx?.reason || "MCX status"} · stable`}
+        </span>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        {COMMODITIES.map((sym) => (
-          <CommodityCard
-            key={sym}
-            symbol={sym}
-            data={data[sym]}
-            newsAlert={alertMap[sym]}
-            loading={loading}
-          />
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+        {COMMODITIES.map((symbol) => (
+          <CommodityCard key={symbol} symbol={symbol} data={data[symbol]} loading={loading} />
         ))}
       </div>
     </div>

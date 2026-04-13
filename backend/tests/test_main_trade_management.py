@@ -123,6 +123,50 @@ class MainTradeManagementTests(unittest.TestCase):
         self.assertTrue(plan.hard_exit)
         self.assertIn("VWAP", plan.hard_exit_reason)
 
+    def test_breadth_flip_forces_exit_on_weak_long_trade(self) -> None:
+        open_trade = OpenTradeState(
+            id=1,
+            engine="MAIN",
+            symbol="NIFTY",
+            direction="CE",
+            entry_signal="Buy CE",
+            entry_price=23300.0,
+            entry_time=datetime(2026, 3, 25, 4, 30, tzinfo=timezone.utc),
+            entry_confidence=82,
+            success_threshold_points=20.0,
+            stop_points=14.0,
+            hold_cycles=2,
+            max_favorable_points=11.0,
+            max_adverse_points=-4.0,
+        )
+        context = LongSignalContext(
+            session_vwap=23304.0,
+            opening_range_high=23318.0,
+            opening_range_low=23290.0,
+            previous_day_high=23322.0,
+            previous_day_low=23270.0,
+            previous_day_close=23296.0,
+            session_bucket="MIDDAY",
+            event_profile="normal",
+            breadth_available=True,
+            breadth_score=-30,
+            breadth_direction="bearish",
+        )
+        plan = derive_main_trade_management_plan(
+            open_trade=open_trade,
+            current_features=(
+                _feature("5m", current_price=23306.0, prev_price=23300.0),
+                _feature("30m", current_price=23308.0, prev_price=23296.0),
+                _feature("60m", current_price=23310.0, prev_price=23280.0),
+            ),
+            long_context=context,
+            outlook=Bias.BULLISH,
+            confidence=68,
+            current_price=23306.0,
+        )
+        self.assertTrue(plan.hard_exit)
+        self.assertIn("breadth", plan.hard_exit_reason.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

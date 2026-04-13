@@ -23,6 +23,7 @@ _MOMENTUM_THRESHOLDS = {
     "30m": (0.0025, 0.0050),
     "60m": (0.0040, 0.0080),
 }
+_MAIN_MIN_CONFIDENCE = 78
 
 _SUPPORTIVE_BULLISH_BUILDS = {"Long buildup", "Short covering"}
 _SUPPORTIVE_BEARISH_BUILDS = {"Short buildup", "Long unwinding"}
@@ -129,6 +130,16 @@ def _supportive_build(feature: FeatureView, direction: Bias) -> bool:
     if direction == Bias.BEARISH:
         return feature.position_buildup in _SUPPORTIVE_BEARISH_BUILDS
     return False
+
+
+def _breadth_supports_outlook(context: LongSignalContext | None, outlook: Bias, *, min_score: int = 14) -> bool:
+    if context is None or not context.breadth_available:
+        return True
+    if outlook == Bias.BULLISH:
+        return int(context.breadth_score or 0) >= min_score and context.breadth_direction == "bullish"
+    if outlook == Bias.BEARISH:
+        return int(context.breadth_score or 0) <= -min_score and context.breadth_direction == "bearish"
+    return True
 
 
 def _structure_bias_counts(
@@ -253,11 +264,38 @@ def _determine_outlook(
         return Bias.NEUTRAL
 
     if context is not None:
-        if context.event_profile in {"event", "event_expiry"} and b30 != b60:
+        if context.breadth_available:
+            if b30 == Bias.BULLISH and b60 == Bias.BULLISH and not _breadth_supports_outlook(context, Bias.BULLISH):
+                return Bias.NEUTRAL
+            if b30 == Bias.BEARISH and b60 == Bias.BEARISH and not _breadth_supports_outlook(context, Bias.BEARISH):
+                return Bias.NEUTRAL
+        if (
+            context.event_profile in {"event", "event_expiry"}
+            and b30 != b60
+            and abs(structure_bull - structure_bear) <= 1
+        ):
             return Bias.NEUTRAL
         if context.is_expiry_day and context.session_bucket == "CLOSING":
             if structure_bull < 3 and structure_bear < 3:
                 return Bias.NEUTRAL
+        if (
+            context.news_impact_score >= 85
+            and context.session_bucket in {"OPENING", "MIDDAY"}
+            and context.opening_range_high is not None
+            and context.opening_range_low is not None
+            and not _price_above(context.opening_range_high, float(f5.current_price), buffer_pct=0.0002)
+            and not _price_below(context.opening_range_low, float(f5.current_price), buffer_pct=0.0002)
+        ):
+            return Bias.NEUTRAL
+        if (
+            context.session_bucket == "MIDDAY"
+            and context.opening_range_high is not None
+            and context.opening_range_low is not None
+            and not _price_above(context.opening_range_high, float(f5.current_price), buffer_pct=0.0002)
+            and not _price_below(context.opening_range_low, float(f5.current_price), buffer_pct=0.0002)
+            and abs(structure_bull - structure_bear) <= 1
+        ):
+            return Bias.NEUTRAL
 
     if b30 == b60 and b30 != Bias.NEUTRAL:
         if b30 == Bias.BULLISH and structure_bull >= structure_bear:
@@ -284,11 +322,13 @@ def _entry_ready(
     if outlook == Bias.NEUTRAL:
         return False
 
-    f5, f30, _ = features
+    f5, f30, f60 = features
     bias_5m = _bias_from_feature(f5)
-    if bias_5m != outlook:
+    if bias_5m not in {outlook, Bias.NEUTRAL}:
         return False
     if f5.price_rangebound and f5.rangebound_oi_both_sides:
+        return False
+    if not _breadth_supports_outlook(context, outlook):
         return False
 
     price = float(f5.current_price)
@@ -305,33 +345,111 @@ def _entry_ready(
         or (_price_below(context.previous_day_low, price, buffer_pct=0.0004) if context.previous_day_low is not None else False)
     )
     stricter_profile = context is not None and context.event_profile in {"event", "event_expiry", "expiry"}
+    news_shock_guard = context is not None and context.news_impact_score >= 85
+    low_volatility_guard = context is not None and context.intraday_volatility_ratio < 0.82
 
     if outlook == Bias.BULLISH:
-        normal_ready = (
-            f5.breakout_flag
-            or f5.volume_spike
-            or above_finish_levels
-            or (_supportive_build(f5, outlook) and _momentum_strength(f5) >= 1)
-            or (_supportive_build(f30, outlook) and _momentum_strength(f5) >= 2)
+        continuation_override_bull = (
+            bias_5m in {Bias.NEUTRAL, Bias.BULLISH}
+            and _momentum_strength(f30) >= 2
+            and _momentum_strength(f60) >= 2
+            and above_vwap
+            and above_finish_levels
+            and (
+                f30.breakout_flag
+                or f60.breakout_flag
+                or _supportive_build(f30, outlook)
+            )
+            and (
+                bias_5m == Bias.NEUTRAL
+                or f5.breakout_flag
+                or f5.volume_spike
+                or _supportive_build(f5, outlook)
+                or _momentum_strength(f5) >= 2
+            )
         )
+        bullish_checks = 0
+        if f5.breakout_flag:
+            bullish_checks += 1
+        if f5.volume_spike:
+            bullish_checks += 1
+        if above_finish_levels:
+            bullish_checks += 1
+        if _supportive_build(f5, outlook):
+            bullish_checks += 1
+        if _supportive_build(f30, outlook) and _momentum_strength(f5) >= 2:
+            bullish_checks += 1
+        if _momentum_strength(f30) >= 1 and _momentum_strength(f60) >= 1:
+            bullish_checks += 1
+        if context is not None and context.breadth_available and context.breadth_score >= 18:
+            bullish_checks += 1
+        normal_ready = bullish_checks >= 3 and _momentum_strength(f5) >= 1 and (
+            f5.breakout_flag or (_momentum_strength(f5) >= 2 and f5.volume_spike)
+        )
+        if news_shock_guard and not (f5.breakout_flag and f5.volume_spike) and not continuation_override_bull:
+            return False
+        if low_volatility_guard and not f5.breakout_flag and not continuation_override_bull:
+            return False
         if stricter_profile:
             return above_vwap and above_finish_levels and (
-                f5.breakout_flag or (_momentum_strength(f5) >= 2 and f5.volume_spike)
+                (
+                    bullish_checks >= 3
+                    and (f5.breakout_flag or (_momentum_strength(f5) >= 2 and f5.volume_spike))
+                )
+                or continuation_override_bull
             )
-        return above_vwap and normal_ready
+        return above_vwap and (normal_ready or continuation_override_bull)
 
-    normal_ready = (
-        f5.breakdown_flag
-        or f5.volume_spike
-        or below_finish_levels
-        or (_supportive_build(f5, outlook) and _momentum_strength(f5) >= 1)
-        or (_supportive_build(f30, outlook) and _momentum_strength(f5) >= 2)
+    continuation_override_bear = (
+        bias_5m in {Bias.NEUTRAL, Bias.BEARISH}
+        and _momentum_strength(f30) >= 2
+        and _momentum_strength(f60) >= 2
+        and below_vwap
+        and below_finish_levels
+        and (
+            f30.breakdown_flag
+            or f60.breakdown_flag
+            or _supportive_build(f30, outlook)
+        )
+        and (
+            bias_5m == Bias.NEUTRAL
+            or f5.breakdown_flag
+            or f5.volume_spike
+            or _supportive_build(f5, outlook)
+            or _momentum_strength(f5) >= 2
+        )
     )
+    bearish_checks = 0
+    if f5.breakdown_flag:
+        bearish_checks += 1
+    if f5.volume_spike:
+        bearish_checks += 1
+    if below_finish_levels:
+        bearish_checks += 1
+    if _supportive_build(f5, outlook):
+        bearish_checks += 1
+    if _supportive_build(f30, outlook) and _momentum_strength(f5) >= 2:
+        bearish_checks += 1
+    if _momentum_strength(f30) >= 1 and _momentum_strength(f60) >= 1:
+        bearish_checks += 1
+    if context is not None and context.breadth_available and context.breadth_score <= -18:
+        bearish_checks += 1
+    normal_ready = bearish_checks >= 3 and _momentum_strength(f5) >= 1 and (
+        f5.breakdown_flag or (_momentum_strength(f5) >= 2 and f5.volume_spike)
+    )
+    if news_shock_guard and not (f5.breakdown_flag and f5.volume_spike) and not continuation_override_bear:
+        return False
+    if low_volatility_guard and not f5.breakdown_flag and not continuation_override_bear:
+        return False
     if stricter_profile:
         return below_vwap and below_finish_levels and (
-            f5.breakdown_flag or (_momentum_strength(f5) >= 2 and f5.volume_spike)
+            (
+                bearish_checks >= 3
+                and (f5.breakdown_flag or (_momentum_strength(f5) >= 2 and f5.volume_spike))
+            )
+            or continuation_override_bear
         )
-    return below_vwap and normal_ready
+    return below_vwap and (normal_ready or continuation_override_bear)
 
 
 def _confidence_from_features(
@@ -356,6 +474,9 @@ def _confidence_from_features(
     if entry_ready:
         score += 12
         reasons.append("5m timing is aligned for entry.")
+        if _momentum_strength(f5) >= 1:
+            score += 6
+            reasons.append("5m momentum is strong enough to support execution.")
     else:
         bias_5m = _bias_from_feature(f5)
         if bias_5m == outlook:
@@ -366,6 +487,9 @@ def _confidence_from_features(
         else:
             score -= 10
             reasons.append("5m timing is still opposing the higher-timeframe outlook.")
+    if _momentum_strength(f5) == 0:
+        score -= 6
+        reasons.append("5m momentum is still soft for a high-conviction trade.")
 
     for feature in (f60, f30, f5):
         score += _momentum_strength(feature) * 4
@@ -412,6 +536,14 @@ def _confidence_from_features(
             else:
                 score -= 6
                 reasons.append("Market structure is leaning against the higher-timeframe bias.")
+
+        if context.breadth_available:
+            if _breadth_supports_outlook(context, outlook):
+                score += 8
+                reasons.append("Internal breadth and leadership are aligned with the finish bias.")
+            else:
+                score -= 14
+                reasons.append("Internal breadth is diverging from the higher-timeframe bias.")
 
     writer_support = 0
     build_support = 0
@@ -471,11 +603,17 @@ def _confidence_from_features(
             reasons.append(rr_reason)
 
     if context is not None:
-        if context.event_profile in {"event", "event_expiry"}:
+        if context.intraday_volatility_ratio < 0.82 and not aligned_break:
             score -= 8
+            reasons.append("Intraday volatility is compressed, so the setup needs more proof than it currently has.")
+        elif context.intraday_volatility_ratio > 1.3 and aligned_break:
+            score += 4
+            reasons.append("Volatility expansion is supporting the directional move.")
+        if context.event_profile in {"event", "event_expiry"}:
+            score -= 10
             reasons.append("Global event risk is elevated, so the finish bias needs extra caution.")
         elif context.event_profile == "expiry":
-            score -= 6
+            score -= 8
             reasons.append("Expiry proximity is increasing intraday noise.")
         elif context.expiry_bucket == "1DTE":
             score -= 3
@@ -490,6 +628,54 @@ def _confidence_from_features(
         reasons.append("Some feature snapshots have weaker data quality.")
 
     return max(0, min(100, score)), reasons
+
+
+def _high_conviction_entry_override(
+    features: tuple[FeatureView, FeatureView, FeatureView],
+    outlook: Bias,
+    context: LongSignalContext | None,
+    confidence: int,
+) -> bool:
+    if outlook == Bias.NEUTRAL or confidence < 88:
+        return False
+
+    f5, f30, f60 = features
+    if _momentum_strength(f30) < 2 or _momentum_strength(f60) < 2:
+        return False
+    if _bias_from_feature(f5) not in {outlook, Bias.NEUTRAL}:
+        return False
+    if not _breadth_supports_outlook(context, outlook, min_score=10):
+        return False
+
+    price = float(f5.current_price)
+    if context is not None and context.session_vwap is not None:
+        if outlook == Bias.BULLISH and not _price_above(context.session_vwap, price, buffer_pct=0.0):
+            return False
+        if outlook == Bias.BEARISH and not _price_below(context.session_vwap, price, buffer_pct=0.0):
+            return False
+
+    has_5m_quality = bool(
+        f5.breakout_flag
+        or f5.breakdown_flag
+        or f5.volume_spike
+        or _supportive_build(f5, outlook)
+        or _momentum_strength(f5) >= 2
+    )
+    if not has_5m_quality:
+        return False
+
+    if outlook == Bias.BULLISH:
+        return bool(
+            f30.breakout_flag
+            or f60.breakout_flag
+            or _supportive_build(f30, outlook)
+        )
+
+    return bool(
+        f30.breakdown_flag
+        or f60.breakdown_flag
+        or _supportive_build(f30, outlook)
+    )
 
 
 def determine_main_outlook(
@@ -599,6 +785,20 @@ def generate_main_signal_from_features(
         previous_features=previous_features,
         entry_ready=entry_ready,
     )
+    high_conviction_override = False
+    if not entry_ready and _high_conviction_entry_override(current_features, outlook, context, confidence):
+        entry_ready = True
+        high_conviction_override = True
+        confidence, parts = _confidence_from_features(
+            current_features,
+            outlook,
+            context,
+            previous_features=previous_features,
+            entry_ready=True,
+        )
+        parts.append(
+            "High-conviction continuation override is active even though the 5m trigger detail is still developing."
+        )
     reason = " ".join(dict.fromkeys(parts))
 
     if not entry_ready:
@@ -622,19 +822,21 @@ def generate_main_signal_from_features(
         previous_outlook = _determine_outlook(previous_features, context)
         previous_entry_ready = _entry_ready(previous_features, outlook, context) if previous_outlook == outlook else False
         if previous_outlook != outlook or not previous_entry_ready:
-            return TradingSignal(
-                symbol=symbol,
-                signal=Signal.WAIT,
-                confidence=confidence,
-                support=support,
-                resistance=resistance,
-                bias_5m=current_biases[0],
-                bias_30m=current_biases[1],
-                bias_60m=current_biases[2],
-                reason=f"{reason} The outlook is present, but the entry has not persisted for two cycles yet.".strip(),
-            )
+            if not high_conviction_override:
+                return TradingSignal(
+                    symbol=symbol,
+                    signal=Signal.WAIT,
+                    confidence=confidence,
+                    support=support,
+                    resistance=resistance,
+                    bias_5m=current_biases[0],
+                    bias_30m=current_biases[1],
+                    bias_60m=current_biases[2],
+                    reason=f"{reason} The outlook is present, but the entry has not persisted for two cycles yet.".strip(),
+                )
+            reason = f"{reason} High-conviction continuation override bypassed the two-cycle persistence gate.".strip()
 
-    if confidence < 70:
+    if confidence < _MAIN_MIN_CONFIDENCE:
         return TradingSignal(
             symbol=symbol,
             signal=Signal.WAIT,
@@ -644,7 +846,7 @@ def generate_main_signal_from_features(
             bias_5m=current_biases[0],
             bias_30m=current_biases[1],
             bias_60m=current_biases[2],
-            reason=f"{reason} Outlook is {outlook.value.lower()}, but confidence {confidence}% is still below the activation threshold.".strip(),
+            reason=f"{reason} Outlook is {outlook.value.lower()}, but confidence {confidence}% is still below the {_MAIN_MIN_CONFIDENCE}% activation threshold.".strip(),
         )
 
     final_signal = Signal.BUY_CE if outlook == Bias.BULLISH else Signal.BUY_PE

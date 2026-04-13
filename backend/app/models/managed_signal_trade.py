@@ -16,6 +16,7 @@ class ManagedSignalTrade(Base):
     direction: Mapped[str] = mapped_column(String(4), nullable=False)
     entry_signal: Mapped[str] = mapped_column(String(20), nullable=False)
     latest_signal: Mapped[str] = mapped_column(String(20), nullable=False)
+    signal_version: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
 
     entry_confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     latest_confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

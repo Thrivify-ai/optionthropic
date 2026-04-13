@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 
 import { analyticsApi } from "../lib/api";
-import { isMarketOpen } from "./MarketTicker";
+import { defaultMarketStatus, isMarketOpen } from "./MarketTicker";
 
 const SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"];
 const POLL_MS = 15_000;
@@ -89,7 +89,7 @@ function HistoryEntry({ entry }) {
       )}
     >
       <div className="flex min-w-0 items-center gap-2">
-        <span className="w-14 shrink-0 font-mono text-slate-500">{entry.time}</span>
+        <span className="w-28 shrink-0 font-mono text-slate-500">{entry.datetimeLabel || entry.time}</span>
         <span className={clsx("shrink-0 font-bold", meta.color)}>{entry.signal}</span>
         {entry.level != null ? (
           <span className="shrink-0 font-mono text-slate-400">
@@ -129,6 +129,14 @@ function StatPill({ children, tone = "neutral" }) {
   );
 }
 
+function formatAge(seconds) {
+  if (!Number.isFinite(seconds)) return "-";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const mins = Math.floor(seconds / 60);
+  const rem = Math.round(seconds % 60);
+  return `${mins}m ${rem}s`;
+}
+
 function SymbolCard({ symbol, data, prev, history, loading, countdown }) {
   const quickSignal = data?.quick_signal ?? "Wait";
   const meta = META[quickSignal] ?? META.Wait;
@@ -138,6 +146,8 @@ function SymbolCard({ symbol, data, prev, history, loading, countdown }) {
   const confidence = Number.isFinite(data?.confidence) ? data.confidence : null;
   const momentum = data?.momentum;
   const stabilityCycles = data?.stability_cycles ?? 0;
+  const confirmationCount = Number.isFinite(data?.confirmation_count) ? data.confirmation_count : null;
+  const requiredConfirmations = Number.isFinite(data?.required_confirmations) ? data.required_confirmations : null;
   const stateReason = data?.state_reason;
   const rawSignal = data?.raw_signal ?? "Wait";
   const activeAgeSeconds = Number.isFinite(data?.active_age_seconds) ? data.active_age_seconds : null;
@@ -148,6 +158,27 @@ function SymbolCard({ symbol, data, prev, history, loading, countdown }) {
   const currentPoints = Number.isFinite(data?.current_points) ? data.current_points : null;
   const successThreshold = Number.isFinite(data?.success_threshold_points) ? data.success_threshold_points : null;
   const stopPoints = Number.isFinite(data?.stop_points) ? data.stop_points : null;
+  const breadthScore = Number.isFinite(data?.breadth_score) ? data.breadth_score : null;
+  const volatilityRatio = Number.isFinite(data?.volatility_ratio) ? data.volatility_ratio : null;
+  const newsImpact = Number.isFinite(data?.news_impact_score) ? data.news_impact_score : null;
+  const signalType = data?.signal_type ? String(data.signal_type) : null;
+  const noTradeRegime = data?.no_trade_regime;
+  const dataSource = data?.data_source;
+  const priceAgeSeconds = Number.isFinite(data?.price_age_seconds) ? data.price_age_seconds : null;
+  const snapshotAgeSeconds = Number.isFinite(data?.snapshot_age_seconds) ? data.snapshot_age_seconds : null;
+  const signalTimestamp = data?.timestamp ? new Date(data.timestamp) : null;
+  const hasActiveTrade =
+    entryPrice != null ||
+    currentPoints != null ||
+    quickSignal === "Buy CE" ||
+    quickSignal === "Buy PE" ||
+    quickSignal === "Hold CE" ||
+    quickSignal === "Hold PE" ||
+    quickSignal === "Exit CE" ||
+    quickSignal === "Exit PE";
+  const primaryReason = noTradeRegime
+    ? `No-trade regime: ${noTradeRegime}`
+    : data?.reason || "No active setup yet.";
   const symbolHistory = history.filter((entry) => entry.symbol === symbol).slice(0, MAX_HISTORY_DISPLAY);
 
   return (
@@ -202,6 +233,19 @@ function SymbolCard({ symbol, data, prev, history, loading, countdown }) {
                 {momentum}
               </StatPill>
             ) : null}
+            {confirmationCount != null ? (
+              <StatPill
+                tone={
+                  requiredConfirmations != null && confirmationCount >= requiredConfirmations
+                    ? "good"
+                    : stateKey === "candidate" || stateKey === "setup"
+                      ? "warn"
+                      : "neutral"
+                }
+              >
+                Confirm {confirmationCount}/{requiredConfirmations ?? "?"}
+              </StatPill>
+            ) : null}
             {stabilityCycles > 0 ? <StatPill>Cycles {stabilityCycles}</StatPill> : null}
             {activeAgeSeconds != null && stateKey === "active" ? <StatPill>Live {activeAgeSeconds}s</StatPill> : null}
             {cooldownSeconds != null && cooldownSeconds > 0 ? <StatPill>Cooldown {cooldownSeconds}s</StatPill> : null}
@@ -211,9 +255,40 @@ function SymbolCard({ symbol, data, prev, history, loading, countdown }) {
                 {currentPoints} pts
               </StatPill>
             ) : null}
+            {breadthScore != null ? (
+              <StatPill tone={breadthScore >= 14 ? "good" : breadthScore <= -14 ? "danger" : "warn"}>
+                Breadth {breadthScore > 0 ? "+" : ""}
+                {breadthScore}
+              </StatPill>
+            ) : null}
+            {volatilityRatio != null ? <StatPill>Vol x{volatilityRatio.toFixed(2)}</StatPill> : null}
+            {newsImpact != null && newsImpact > 0 ? (
+              <StatPill tone={newsImpact >= 85 ? "danger" : newsImpact >= 70 ? "warn" : "neutral"}>
+                News {newsImpact}
+              </StatPill>
+            ) : null}
+            {signalType ? (
+              <StatPill>
+                Type {signalType.replaceAll("_", " ")}
+              </StatPill>
+            ) : null}
+            {dataSource ? <StatPill>Feed {String(dataSource).toUpperCase()}</StatPill> : null}
+            {priceAgeSeconds != null ? <StatPill>Tape {formatAge(priceAgeSeconds)}</StatPill> : null}
+            {snapshotAgeSeconds != null ? <StatPill>Snap {formatAge(snapshotAgeSeconds)}</StatPill> : null}
+            {signalTimestamp ? (
+              <StatPill>
+                As of{" "}
+                {signalTimestamp.toLocaleTimeString("en-IN", {
+                  hour12: false,
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  second: "2-digit",
+                })}
+              </StatPill>
+            ) : null}
           </div>
 
-          <p className="mt-3 text-xs leading-relaxed text-slate-300">{data?.reason || "No active setup yet."}</p>
+          <p className="mt-3 text-xs leading-relaxed text-slate-300">{primaryReason}</p>
           {stateReason && stateReason !== data?.reason ? (
             <p className="mt-1 text-[11px] leading-relaxed text-slate-500">{stateReason}</p>
           ) : null}
@@ -231,7 +306,7 @@ function SymbolCard({ symbol, data, prev, history, loading, countdown }) {
             </div>
           ) : null}
 
-          {(entryPrice || successThreshold != null || stopPoints != null) ? (
+          {hasActiveTrade && (entryPrice || successThreshold != null || stopPoints != null) ? (
             <div className="mt-3 grid grid-cols-3 gap-2">
               <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
                 <p className="text-[10px] text-slate-500">Entry</p>
@@ -279,11 +354,20 @@ export default function QuickSignalsCard() {
   const [lastUpdate, setLastUpdate] = useState(null);
   const countRef = useRef(POLL_MS / 1000);
   const lastSavedRef = useRef({});
-  const [open, setOpen] = useState(isMarketOpen());
+  const [marketStatus, setMarketStatus] = useState(defaultMarketStatus());
+  const [open, setOpen] = useState(false);
+
+  const syncMarketStatus = useCallback(async () => {
+    const status = await analyticsApi.marketStatus();
+    setMarketStatus(status);
+    const trackerOpen = isMarketOpen(status);
+    setOpen(trackerOpen);
+    return trackerOpen;
+  }, []);
 
   const loadHistory = useCallback(() => {
     analyticsApi
-      .buySignalHistory()
+      .buySignalHistory(null, { todayOnly: true, limit: 200 })
       .then((list) => {
         if (!Array.isArray(list) || list.length === 0) return;
         const seen = new Set();
@@ -300,6 +384,19 @@ export default function QuickSignalsCard() {
             })
             .map((entry) => ({
               id: entry.id,
+              datetimeLabel:
+                entry.datetime_ist ||
+                (entry.created_at
+                  ? new Date(entry.created_at).toLocaleString("en-IN", {
+                      hour12: false,
+                      year: "numeric",
+                      month: "2-digit",
+                      day: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      second: "2-digit",
+                    })
+                  : null),
               time: entry.created_at
                 ? new Date(entry.created_at).toLocaleTimeString("en-IN", {
                     hour12: false,
@@ -319,12 +416,11 @@ export default function QuickSignalsCard() {
   }, []);
 
   const fetchAll = useCallback(async () => {
-    if (!isMarketOpen()) {
+    const trackerOpen = await syncMarketStatus();
+    if (!trackerOpen) {
       setOpen(false);
       return;
     }
-
-    setOpen(true);
 
     try {
       const results = await Promise.all(
@@ -383,6 +479,17 @@ export default function QuickSignalsCard() {
             if (current.some((entry) => entry.id === saved.id)) return current;
             const entry = {
               id: saved.id,
+              datetimeLabel: saved.created_at
+                ? new Date(saved.created_at).toLocaleString("en-IN", {
+                    hour12: false,
+                    year: "numeric",
+                    month: "2-digit",
+                    day: "2-digit",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit",
+                  })
+                : null,
               time: timeStr,
               symbol: row.symbol,
               signal,
@@ -401,22 +508,25 @@ export default function QuickSignalsCard() {
     } finally {
       setLoading(false);
     }
-  }, [signals]);
+  }, [signals, syncMarketStatus]);
 
   useEffect(() => {
     loadHistory();
   }, [loadHistory]);
 
   useEffect(() => {
+    syncMarketStatus();
     fetchAll();
     const id = setInterval(fetchAll, POLL_MS);
     return () => clearInterval(id);
-  }, [fetchAll]);
+  }, [fetchAll, syncMarketStatus]);
 
   useEffect(() => {
-    const id = setInterval(() => setOpen(isMarketOpen()), 15_000);
+    const id = setInterval(() => {
+      syncMarketStatus();
+    }, 15_000);
     return () => clearInterval(id);
-  }, []);
+  }, [syncMarketStatus]);
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -440,6 +550,7 @@ export default function QuickSignalsCard() {
           <div className="flex flex-wrap items-center gap-2">
             <StatPill tone={open ? "good" : "neutral"}>{open ? "LIVE" : "CLOSED"}</StatPill>
             <StatPill>15s cycle</StatPill>
+            {!open && marketStatus?.equities?.reason ? <StatPill>{marketStatus.equities.reason}</StatPill> : null}
             <span className="font-mono text-[11px] text-slate-500">
               {lastUpdate
                 ? lastUpdate.toLocaleTimeString("en-IN", {

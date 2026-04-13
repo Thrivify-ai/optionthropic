@@ -8,6 +8,7 @@ from app.analytics.quick_signal_phase2 import (
     reward_risk_ok,
     session_profile_for,
 )
+from app.analytics.quick_signal_engine import _pro_entry_filter_reason
 
 
 class QuickSignalPhase2Tests(unittest.TestCase):
@@ -46,6 +47,77 @@ class QuickSignalPhase2Tests(unittest.TestCase):
         self.assertFalse(bad)
         self.assertIn("only", bad_reason.lower())
 
+    def test_pro_entry_filter_blocks_countertrend_bounce_chase(self) -> None:
+        reason = _pro_entry_filter_reason(
+            direction="bullish",
+            profile_name="closing",
+            momentum_1m=97.0,
+            momentum_3m=-169.0,
+            mom_3m_threshold=55.0,
+            structural_break=False,
+            fast_consensus=True,
+            volume_spike=True,
+            oi_confirmed=False,
+            breadth_ok=True,
+            news_impact_score=0,
+        )
+
+        self.assertIsNotNone(reason)
+        self.assertIn("countertrend", reason.lower())
+
+    def test_pro_entry_filter_requires_same_direction_1m_tape(self) -> None:
+        reason = _pro_entry_filter_reason(
+            direction="bullish",
+            profile_name="opening",
+            momentum_1m=-20.0,
+            momentum_3m=-124.0,
+            mom_3m_threshold=40.0,
+            structural_break=False,
+            fast_consensus=True,
+            volume_spike=True,
+            oi_confirmed=True,
+            breadth_ok=True,
+            news_impact_score=0,
+        )
+
+        self.assertIsNotNone(reason)
+        self.assertIn("1m tape", reason.lower())
+
+    def test_pro_entry_filter_allows_confirmed_structural_reversal(self) -> None:
+        reason = _pro_entry_filter_reason(
+            direction="bullish",
+            profile_name="opening",
+            momentum_1m=80.0,
+            momentum_3m=-70.0,
+            mom_3m_threshold=45.0,
+            structural_break=True,
+            fast_consensus=True,
+            volume_spike=True,
+            oi_confirmed=True,
+            breadth_ok=True,
+            news_impact_score=0,
+        )
+
+        self.assertIsNone(reason)
+
+    def test_pro_entry_filter_blocks_news_without_followthrough(self) -> None:
+        reason = _pro_entry_filter_reason(
+            direction="bullish",
+            profile_name="closing",
+            momentum_1m=49.0,
+            momentum_3m=91.0,
+            mom_3m_threshold=40.0,
+            structural_break=False,
+            fast_consensus=False,
+            volume_spike=True,
+            oi_confirmed=False,
+            breadth_ok=True,
+            news_impact_score=90,
+        )
+
+        self.assertIsNotNone(reason)
+        self.assertIn("news risk", reason.lower())
+
     def test_confidence_penalizes_traps_and_range(self) -> None:
         clean = quick_signal_confidence(
             bullish=True,
@@ -57,9 +129,17 @@ class QuickSignalPhase2Tests(unittest.TestCase):
             volume_spike=True,
             oi_confirmed=True,
             persistent=True,
+            confirmation_count=4,
+            fresh_data=True,
             trap=False,
             rangebound=False,
             risk_reward_ok=True,
+            breadth_aligned=True,
+            breadth_score=32,
+            short_covering_risk=18,
+            volatility_ratio=1.1,
+            session_name="opening",
+            regime_blocked=False,
         )
         noisy = quick_signal_confidence(
             bullish=True,
@@ -71,14 +151,46 @@ class QuickSignalPhase2Tests(unittest.TestCase):
             volume_spike=False,
             oi_confirmed=False,
             persistent=False,
+            confirmation_count=1,
+            fresh_data=False,
             trap=True,
             rangebound=True,
             risk_reward_ok=False,
+            breadth_aligned=False,
+            breadth_score=-22,
+            short_covering_risk=82,
+            volatility_ratio=0.65,
+            session_name="midday",
+            regime_blocked=True,
         )
 
         self.assertGreater(clean, noisy)
         self.assertGreaterEqual(clean, 70)
         self.assertEqual(noisy, 0)
+
+    def test_breakout_extension_can_fail_reward_risk(self) -> None:
+        ok, _ = reward_risk_ok(
+            "Buy PE",
+            spot=22128.0,
+            support=22140.0,
+            resistance=22200.0,
+            target_move=35.0,
+            breakout=False,
+            breakdown=True,
+        )
+        bad, reason = reward_risk_ok(
+            "Buy CE",
+            spot=22172.0,
+            support=22120.0,
+            resistance=22140.0,
+            target_move=35.0,
+            breakout=True,
+            breakdown=False,
+        )
+
+        self.assertTrue(ok)
+        self.assertFalse(bad)
+        self.assertIn("extended", reason.lower())
 
     def test_lifecycle_promotes_candidate_to_active(self) -> None:
         profile = session_profile_for(datetime(2026, 3, 20, 4, 5, tzinfo=timezone.utc))
@@ -207,10 +319,62 @@ class QuickSignalPhase2Tests(unittest.TestCase):
             now_utc=now_utc,
             profile=profile,
             hard_invalidation=False,
+            data_key="cycle-1",
+        )
+        self.assertEqual(payload["quick_signal"], "Buy CE")
+        self.assertEqual(payload["state"], "active")
+        self.assertIn("one more cycle", payload["state_reason"].lower())
+
+        state, payload = apply_lifecycle(
+            state,
+            raw_signal="Wait",
+            confidence=34,
+            now_utc=now_utc + timedelta(seconds=15),
+            profile=profile,
+            hard_invalidation=False,
+            data_key="cycle-2",
         )
         self.assertEqual(payload["quick_signal"], "Wait")
         self.assertEqual(payload["state"], "cooldown")
         self.assertGreater(payload["cooldown_seconds_remaining"], 0)
+
+    def test_lifecycle_requires_persistent_opposite_signal_before_exit(self) -> None:
+        profile = session_profile_for(datetime(2026, 3, 20, 4, 5, tzinfo=timezone.utc))
+        now_utc = datetime(2026, 3, 20, 4, 5, tzinfo=timezone.utc)
+        activated_at = now_utc - timedelta(seconds=profile.min_hold_seconds + 8)
+        state = QuickSignalLifecycleState(
+            state="active",
+            candidate_signal="Buy CE",
+            candidate_count=profile.confirm_cycles,
+            active_signal="Buy CE",
+            activated_at=activated_at.isoformat(),
+            last_seen_at=activated_at.isoformat(),
+            confidence=89,
+        )
+
+        state, payload = apply_lifecycle(
+            state,
+            raw_signal="Buy PE",
+            confidence=93,
+            now_utc=now_utc,
+            profile=profile,
+            hard_invalidation=False,
+            data_key="flip-1",
+        )
+        self.assertEqual(payload["quick_signal"], "Buy CE")
+        self.assertEqual(payload["state"], "active")
+
+        state, payload = apply_lifecycle(
+            state,
+            raw_signal="Buy PE",
+            confidence=94,
+            now_utc=now_utc + timedelta(seconds=15),
+            profile=profile,
+            hard_invalidation=False,
+            data_key="flip-2",
+        )
+        self.assertEqual(payload["quick_signal"], "Wait")
+        self.assertEqual(payload["state"], "cooldown")
 
     def test_hard_invalidation_forces_immediate_cooldown(self) -> None:
         profile = session_profile_for(datetime(2026, 3, 20, 4, 5, tzinfo=timezone.utc))

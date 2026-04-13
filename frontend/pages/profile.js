@@ -51,6 +51,12 @@ export default function Profile() {
             <div className="card space-y-3">
               <div>
                 <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">
+                  First name
+                </p>
+                <p className="text-slate-200">{user.first_name || user.email?.split("@")?.[0] || "Member"}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">
                   Email
                 </p>
                 <p className="text-slate-200">{user.email}</p>

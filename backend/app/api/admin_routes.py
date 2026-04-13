@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.admin_signal_monitor import build_admin_signal_monitor_payload
+from app.analytics.broadcast_desk import build_broadcast_desk_payload
 from app.analytics.quant_signal_capture import build_quant_signal_analytics_payload
 from app.analytics.signal_outcomes import build_signal_analytics_payload
 from app.api.auth_routes import require_admin
@@ -176,6 +178,16 @@ async def signal_analytics(
 ) -> Any:
     legacy = await build_signal_analytics_payload(session, days=days, limit=limit)
     quant = await build_quant_signal_analytics_payload(session, days=days, limit=max(limit, 300))
+    monitor = await build_admin_signal_monitor_payload(session, days=max(days, 7))
     payload = dict(legacy)
     payload.update(quant)
+    payload.update(monitor)
     return payload
+
+
+@router.get("/broadcast-desk")
+async def broadcast_desk(
+    _: Annotated[User, Depends(require_admin)],
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> Any:
+    return await build_broadcast_desk_payload(session)

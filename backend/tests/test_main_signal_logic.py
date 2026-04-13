@@ -64,6 +64,13 @@ def _context(
     days_to_expiry: int | None = 3,
     expiry_bucket: str | None = "2_5DTE",
     is_expiry_day: bool = False,
+    breadth_score: int = 0,
+    breadth_direction: str | None = None,
+    breadth_reason: str | None = None,
+    breadth_available: bool = False,
+    intraday_volatility_ratio: float = 1.0,
+    avg_abs_move_1m: float | None = None,
+    opening_range_width_points: float | None = None,
 ) -> LongSignalContext:
     return LongSignalContext(
         session_vwap=session_vwap,
@@ -78,6 +85,13 @@ def _context(
         days_to_expiry=days_to_expiry,
         expiry_bucket=expiry_bucket,
         is_expiry_day=is_expiry_day,
+        breadth_score=breadth_score,
+        breadth_direction=breadth_direction,
+        breadth_reason=breadth_reason,
+        breadth_available=breadth_available,
+        intraday_volatility_ratio=intraday_volatility_ratio,
+        avg_abs_move_1m=avg_abs_move_1m,
+        opening_range_width_points=opening_range_width_points,
     )
 
 
@@ -123,7 +137,7 @@ class MainSignalLogicTests(unittest.TestCase):
         )
         result = generate_main_signal_from_features("NIFTY", current, previous, context=_context())
         self.assertEqual(result.signal.value, "Wait")
-        self.assertIn("persisted", result.reason)
+        self.assertIn("stable directional outlook", result.reason.lower())
 
     def test_waits_in_rangebound_state(self) -> None:
         current = (
@@ -150,7 +164,12 @@ class MainSignalLogicTests(unittest.TestCase):
             "NIFTY",
             current,
             previous,
-            context=_context(session_vwap=101.8, opening_range_high=102.2, opening_range_low=100.1),
+            context=_context(
+                session_bucket="OPENING",
+                session_vwap=101.8,
+                opening_range_high=100.3,
+                opening_range_low=99.9,
+            ),
         )
         self.assertEqual(result.signal.value, "Wait")
         self.assertIn("wrong side of session vwap", result.reason.lower())
@@ -184,6 +203,229 @@ class MainSignalLogicTests(unittest.TestCase):
         )
         self.assertEqual(result.signal.value, "Wait")
         self.assertIn("finish bias", result.reason.lower())
+
+    def test_breadth_divergence_blocks_bullish_entry(self) -> None:
+        current = (
+            _feature("5m", current_price=102.4, prev_price=100.0, breakout_flag=True),
+            _feature("30m", current_price=104.0, prev_price=100.0, breakout_flag=True),
+            _feature("60m", current_price=107.0, prev_price=100.0, breakout_flag=True),
+        )
+        previous = (
+            _feature("5m", current_price=102.0, prev_price=99.8, breakout_flag=True),
+            _feature("30m", current_price=103.6, prev_price=99.6, breakout_flag=True),
+            _feature("60m", current_price=106.6, prev_price=99.5, breakout_flag=True),
+        )
+
+        result = generate_main_signal_from_features(
+            "NIFTY",
+            current,
+            previous,
+            context=_context(
+                breadth_available=True,
+                breadth_score=-28,
+                breadth_direction="bearish",
+                breadth_reason="Banks and heavyweights are not confirming.",
+            ),
+        )
+
+        self.assertEqual(result.signal.value, "Wait")
+        self.assertIn("higher-timeframe structure", result.reason.lower())
+
+    def test_emits_buy_pe_on_continuation_when_5m_is_neutral(self) -> None:
+        current = (
+            _feature(
+                "5m",
+                current_price=98.0,
+                prev_price=98.0,
+                pcr_oi=1.0,
+                writer_bullish_score=0,
+                writer_bearish_score=0,
+                position_buildup=None,
+                breakout_flag=False,
+                breakdown_flag=False,
+                volume_spike=False,
+            ),
+            _feature(
+                "30m",
+                current_price=95.0,
+                prev_price=100.0,
+                pcr_oi=0.8,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=True,
+            ),
+            _feature(
+                "60m",
+                current_price=90.0,
+                prev_price=100.0,
+                pcr_oi=0.8,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=True,
+            ),
+        )
+        previous = (
+            _feature(
+                "5m",
+                current_price=98.2,
+                prev_price=98.2,
+                pcr_oi=1.0,
+                writer_bullish_score=0,
+                writer_bearish_score=0,
+                position_buildup=None,
+                breakout_flag=False,
+                breakdown_flag=False,
+                volume_spike=False,
+            ),
+            _feature(
+                "30m",
+                current_price=95.5,
+                prev_price=100.2,
+                pcr_oi=0.8,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=True,
+            ),
+            _feature(
+                "60m",
+                current_price=90.5,
+                prev_price=100.2,
+                pcr_oi=0.8,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=True,
+            ),
+        )
+
+        result = generate_main_signal_from_features(
+            "NIFTY",
+            current,
+            previous,
+            context=_context(
+                session_bucket="MIDDAY",
+                session_vwap=99.4,
+                opening_range_high=100.1,
+                opening_range_low=98.8,
+                previous_day_high=101.0,
+                previous_day_low=99.0,
+                breadth_available=True,
+                breadth_score=-22,
+                breadth_direction="bearish",
+                event_profile="event",
+                news_impact_score=88,
+                intraday_volatility_ratio=1.12,
+            ),
+        )
+
+        self.assertEqual(result.signal.value, "Buy PE")
+        self.assertGreaterEqual(result.confidence, 82)
+
+    def test_high_conviction_override_can_bypass_persistence_gate(self) -> None:
+        current = (
+            _feature(
+                "5m",
+                current_price=96.8,
+                prev_price=97.6,
+                pcr_oi=0.86,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=False,
+                volume_spike=False,
+            ),
+            _feature(
+                "30m",
+                current_price=94.2,
+                prev_price=100.2,
+                pcr_oi=0.78,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=True,
+                volume_spike=True,
+            ),
+            _feature(
+                "60m",
+                current_price=89.8,
+                prev_price=100.1,
+                pcr_oi=0.76,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=True,
+                volume_spike=True,
+            ),
+        )
+        previous = (
+            _feature(
+                "5m",
+                current_price=97.5,
+                prev_price=97.5,
+                pcr_oi=1.0,
+                writer_bullish_score=0,
+                writer_bearish_score=0,
+                position_buildup=None,
+                breakout_flag=False,
+                breakdown_flag=False,
+                volume_spike=False,
+            ),
+            _feature(
+                "30m",
+                current_price=95.0,
+                prev_price=100.0,
+                pcr_oi=0.8,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=True,
+                volume_spike=False,
+            ),
+            _feature(
+                "60m",
+                current_price=90.3,
+                prev_price=100.0,
+                pcr_oi=0.8,
+                writer_bullish_score=0,
+                writer_bearish_score=1,
+                position_buildup="Short buildup",
+                breakout_flag=False,
+                breakdown_flag=True,
+                volume_spike=False,
+            ),
+        )
+
+        result = generate_main_signal_from_features(
+            "SENSEX",
+            current,
+            previous,
+            context=_context(
+                session_bucket="MIDDAY",
+                session_vwap=98.8,
+                opening_range_high=99.4,
+                opening_range_low=97.9,
+                previous_day_high=100.8,
+                previous_day_low=98.1,
+                breadth_available=True,
+                breadth_score=-28,
+                breadth_direction="bearish",
+                intraday_volatility_ratio=1.06,
+            ),
+        )
+
+        self.assertEqual(result.signal.value, "Buy PE")
+        self.assertGreaterEqual(result.confidence, 88)
 
     def test_derive_signal_context_reports_setup_for_higher_timeframe_alignment(self) -> None:
         ctx = derive_signal_context("Wait", "Neutral", "Bullish", "Bullish", 58)

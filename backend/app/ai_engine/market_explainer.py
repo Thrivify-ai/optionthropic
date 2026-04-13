@@ -16,6 +16,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.alerts.global_news import list_recent_global_news_alerts
 from app.analytics.gamma_detection import compute_gamma_walls
 from app.analytics.liquidity_trap_detection import detect_liquidity_traps
 from app.analytics.max_pain_detection import compute_max_pain
@@ -155,6 +156,7 @@ async def _safe_analytics_call(fn: Any, session: AsyncSession, symbol: str) -> A
 async def _build_context(session: AsyncSession, symbol: str) -> dict[str, Any]:
     return {
         "symbol": symbol,
+        "critical_news": await list_recent_global_news_alerts(session, symbols=[symbol], limit=3),
         "pcr": await _safe_analytics_call(compute_pcr, session, symbol),
         "support_resistance": await _safe_analytics_call(compute_support_resistance, session, symbol),
         "gamma_walls": await _safe_analytics_call(compute_gamma_walls, session, symbol),
@@ -174,12 +176,18 @@ def _format_prompt(ctx: dict[str, Any]) -> str:
     ps = ctx.get("positioning_shift", {})
     flow = ctx.get("options_flow", {})
     traps = ctx.get("liquidity_traps", {})
+    critical_news = ctx.get("critical_news", [])[:3]
 
     top_resistance = sr.get("resistance", [{}])[:2]
     top_support = sr.get("support", [{}])[:2]
     top_flows = flow.get("flows", [])[:3]
     top_shifts = ps.get("shifts", [])[:3]
     trap_list = traps.get("traps", [])[:3]
+    top_news = [
+        f"{item.get('title')} (impact {item.get('impact_score', 0)}, source {item.get('source', 'Unknown')})"
+        for item in critical_news
+        if item.get("title")
+    ]
 
     prompt = f"""You are a senior derivatives market analyst specialising in Indian equity index options (NSE/BSE).
 
@@ -206,6 +214,7 @@ Top Positioning Shifts: {[f"Strike {s.get('strike')}: {s.get('call_signal')}/{s.
 Smart Money Flow: {[f"{f.get('flow_type')} {f.get('option_type')} at {f.get('strike')} vol={f.get('volume',0):,}" for f in top_flows]}
 
 Liquidity Traps: {[f"Strike {t.get('strike')} ({t.get('side')})" for t in trap_list]}
+Critical Global News: {top_news or ['No major macro headline']}
 
 === INSTRUCTION ===
 Generate a 3–4 sentence market insight. Example format:

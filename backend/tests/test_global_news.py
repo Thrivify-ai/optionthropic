@@ -40,6 +40,37 @@ class GlobalNewsTests(unittest.TestCase):
         self.assertIn("NIFTY", scored["affected_symbols"])
         self.assertIn("SENSEX", scored["affected_symbols"])
 
+    def test_scoring_marks_natgas_supply_story_as_critical(self) -> None:
+        candidate = NewsCandidate(
+            provider="rss",
+            source="Reuters",
+            title="Natural gas surges after LNG outage and larger-than-expected EIA storage draw",
+            summary="Pipeline disruption tightens supply expectations and fuels volatility in gas markets.",
+            url="https://example.com/natgas-story",
+            published_at=datetime(2026, 3, 20, 5, 30, tzinfo=timezone.utc),
+        )
+
+        scored = score_news_candidate(candidate, now_utc=datetime(2026, 3, 20, 6, 0, tzinfo=timezone.utc))
+
+        self.assertTrue(scored["is_critical"])
+        self.assertGreaterEqual(scored["impact_score"], 70)
+        self.assertIn("NATGAS", scored["affected_symbols"])
+
+    def test_scoring_penalizes_stale_macro_story(self) -> None:
+        candidate = NewsCandidate(
+            provider="rss",
+            source="Reuters",
+            title="Federal Reserve signals rate cuts after soft inflation print",
+            summary="Bond yields fall as traders reprice the policy path.",
+            url="https://example.com/stale-fed-story",
+            published_at=datetime(2026, 3, 16, 6, 0, tzinfo=timezone.utc),
+        )
+
+        scored = score_news_candidate(candidate, now_utc=datetime(2026, 3, 20, 8, 0, tzinfo=timezone.utc))
+
+        self.assertFalse(scored["is_critical"])
+        self.assertLess(scored["impact_score"], 70)
+
     def test_scoring_filters_low_signal_story(self) -> None:
         candidate = NewsCandidate(
             provider="rss",

@@ -15,10 +15,10 @@ import { analyticsApi, authApi } from "../lib/api";
 const SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"];
 const REFRESH_MS = 15000;
 const MAX_HISTORY_ROWS = 12;
+const ACTIVE_INDEX_SIGNALS = ["Buy CE", "Buy PE", "Hold CE", "Hold PE"];
 const TABS = [
   { id: "markets", label: "Markets", icon: "MK" },
   { id: "commodities", label: "Commodities", icon: "CM" },
-  { id: "alerts", label: "Alerts", icon: "AL" },
 ];
 
 function hasProAccess(user) {
@@ -45,12 +45,16 @@ function normalizeHistory(list) {
     .map((entry) => ({
       ...entry,
       timeLabel: entry?.created_at
-        ? new Date(entry.created_at).toLocaleTimeString("en-IN", {
+        ? (entry?.datetime_ist ||
+          new Date(entry.created_at).toLocaleString("en-IN", {
             hour12: false,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
             hour: "2-digit",
             minute: "2-digit",
             second: "2-digit",
-          })
+          }))
         : "--:--:--",
       levelLabel:
         entry?.level != null ? Number(entry.level).toLocaleString("en-IN") : "Spot unavailable",
@@ -202,7 +206,10 @@ export default function ProSignals() {
     let cancelled = false;
 
     const loadDesk = () => {
-      Promise.all([analyticsApi.dashboardOverview(true), analyticsApi.buySignalHistory()])
+      Promise.all([
+        analyticsApi.dashboardOverview(true),
+        analyticsApi.buySignalHistory(null, { todayOnly: true, limit: 200 }),
+      ])
         .then(([overviewData, historyData]) => {
           if (cancelled) return;
           setOverview(overviewData?.symbols || {});
@@ -252,9 +259,9 @@ export default function ProSignals() {
   const quickStates = symbolEntries.map((entry) => entry.quick_signal || {});
   const longStates = symbolEntries.map((entry) => entry.trading_signal || {});
 
-  const activeQuick = quickStates.filter((entry) => ["Buy CE", "Buy PE"].includes(entry.quick_signal)).length;
+  const activeQuick = quickStates.filter((entry) => ACTIVE_INDEX_SIGNALS.includes(entry.quick_signal)).length;
   const formingQuick = quickStates.filter((entry) => entry.state === "candidate" || entry.state === "setup").length;
-  const activeLong = longStates.filter((entry) => ["Buy CE", "Buy PE"].includes(entry.signal)).length;
+  const activeLong = longStates.filter((entry) => ACTIVE_INDEX_SIGNALS.includes(entry.signal)).length;
   const bullishOutlook = longStates.filter((entry) => entry.outlook === "Bullish" || entry.bias_60m === "Bullish").length;
   const bearishOutlook = longStates.filter((entry) => entry.outlook === "Bearish" || entry.bias_60m === "Bearish").length;
 
@@ -324,9 +331,8 @@ export default function ProSignals() {
               </div>
 
               <p className="text-xs text-slate-500">
-                {tab === "markets" && "Quick signals, long bias, market conditions, and AI desk notes."}
+                {tab === "markets" && "Quick signals, long bias, market conditions, AI desk notes, and critical alerts."}
                 {tab === "commodities" && "Cross-asset watchlist with news-aware commodity cards."}
-                {tab === "alerts" && "Critical global alerts and saved desk-call history in one place."}
               </p>
             </div>
           </div>
@@ -377,6 +383,24 @@ export default function ProSignals() {
               />
               <AIInsightsPanel refreshTick={refreshTick} />
             </section>
+
+            <section className="space-y-4">
+              <SectionHeader
+                kicker="Event radar"
+                title="Critical Alerts and Desk History"
+                description="Global headline risk and the recent desk calls that mattered, without leaving the market workflow."
+                badge={historyLoading ? "Loading" : `${history.length} recent calls`}
+                badgeTone="sky"
+              />
+              <div className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
+                <div className="space-y-4">
+                  <GlobalAlertsPanel />
+                </div>
+                <div className="space-y-4">
+                  <RecentDeskCalls history={history} loading={historyLoading} />
+                </div>
+              </div>
+            </section>
           </section>
         )}
 
@@ -393,16 +417,6 @@ export default function ProSignals() {
           </section>
         )}
 
-        {tab === "alerts" && (
-          <section className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
-            <div className="space-y-4">
-              <GlobalAlertsPanel />
-            </div>
-            <div className="space-y-4">
-              <RecentDeskCalls history={history} loading={historyLoading} />
-            </div>
-          </section>
-        )}
       </div>
     </Layout>
   );

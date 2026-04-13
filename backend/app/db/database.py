@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 from app.config import settings
@@ -62,7 +63,15 @@ async def create_all_tables() -> None:
         collector_heartbeat,
         data_gap_event,
         managed_signal_trade,
+        broadcast_draft,
     )
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all, checkfirst=True)
+        # Safe schema evolution for existing deployments without Alembic migrations.
+        await conn.execute(
+            text(
+                "ALTER TABLE managed_signal_trades "
+                "ADD COLUMN IF NOT EXISTS signal_version VARCHAR(32)"
+            )
+        )

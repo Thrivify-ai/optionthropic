@@ -58,9 +58,15 @@ IMPACT_RULES: tuple[ImpactRule, ...] = (
     ),
     ImpactRule(
         name="Oil and energy shock",
-        keywords=("oil", "crude", "brent", "opec", "energy shock", "middle east"),
+        keywords=("oil", "crude", "brent", "opec", "energy shock", "middle east", "supply cut", "eia", "api inventory", "api inventories", "spr"),
         weight=28,
         symbols=("CRUDEOIL", "NATGAS", "NIFTY", "SENSEX"),
+    ),
+    ImpactRule(
+        name="Natural gas and LNG shock",
+        keywords=("natural gas", "natgas", "lng", "freeport", "pipeline outage", "storage draw", "storage build", "gas supply", "eia storage", "lng outage"),
+        weight=30,
+        symbols=("NATGAS", "CRUDEOIL"),
     ),
     ImpactRule(
         name="Banking and credit risk",
@@ -70,13 +76,19 @@ IMPACT_RULES: tuple[ImpactRule, ...] = (
     ),
     ImpactRule(
         name="Geopolitics and sanctions",
-        keywords=("war", "sanctions", "tariff", "conflict", "missile", "shipping disruption"),
+        keywords=("war", "sanctions", "tariff", "conflict", "missile", "shipping disruption", "strait of hormuz", "red sea", "drone attack"),
         weight=24,
         symbols=("CRUDEOIL", "GOLD", "SILVER", "NIFTY", "SENSEX"),
     ),
     ImpactRule(
+        name="Precious metals and dollar/yields",
+        keywords=("gold", "silver", "bullion", "dollar", "dxy", "real yield", "safe haven", "treasury yield", "bond yield"),
+        weight=26,
+        symbols=("GOLD", "SILVER", "NIFTY", "SENSEX"),
+    ),
+    ImpactRule(
         name="India and FX sensitivity",
-        keywords=("rupee", "usdinr", "india markets", "india economy", "china stimulus", "asia markets"),
+        keywords=("rupee", "usdinr", "india markets", "india economy", "china stimulus", "asia markets", "import duty", "export duty"),
         weight=18,
         symbols=("NIFTY", "BANKNIFTY", "SENSEX"),
     ),
@@ -180,27 +192,39 @@ def score_news_candidate(candidate: NewsCandidate, now_utc: datetime | None = No
     if candidate.published_at is not None:
         age = max((now - candidate.published_at).total_seconds(), 0)
         if age <= 2 * 3600:
-            score += 10
+            score += 12
             themes.append("Fresh headline")
         elif age <= 6 * 3600:
-            score += 5
+            score += 6
+        elif age <= 18 * 3600:
+            score += 2
+        elif age > 48 * 3600:
+            score -= 28
+            themes.append("Stale headline")
+        elif age > 24 * 3600:
+            score -= 16
+            themes.append("Headline aging")
+        if age > 72 * 3600:
+            score = min(score, 48)
+    else:
+        score -= 4
 
     if any(token in text for token in ("bank", "lender", "nbfc", "credit")):
         affected.add("BANKNIFTY")
     if any(token in text for token in ("oil", "crude", "brent", "rupee", "usdinr", "tariff", "export")):
         affected.update(("NIFTY", "SENSEX"))
-    if any(token in text for token in ("oil", "crude", "brent", "opec", "refinery")):
+    if any(token in text for token in ("oil", "crude", "brent", "opec", "refinery", "eia", "api inventory", "api inventories", "spr")):
         affected.add("CRUDEOIL")
-    if any(token in text for token in ("natural gas", "natgas", "lng", "gas supply")):
+    if any(token in text for token in ("natural gas", "natgas", "lng", "gas supply", "freeport", "pipeline outage", "storage draw", "storage build", "eia storage", "lng outage")):
         affected.add("NATGAS")
     if any(token in text for token in ("fomc", "federal reserve", "inflation", "cpi", "payroll", "rbi")):
         affected.update(("NIFTY", "BANKNIFTY", "SENSEX"))
-    if any(token in text for token in ("gold", "silver", "bullion", "treasury yield", "bond yield", "safe haven")):
+    if any(token in text for token in ("gold", "silver", "bullion", "treasury yield", "bond yield", "safe haven", "dollar", "dxy", "real yield")):
         affected.update(("GOLD", "SILVER"))
     if any(token in text for token in ("inflation", "cpi", "federal reserve", "rbi", "rate cut", "rate hike")):
         affected.update(("GOLD", "SILVER"))
 
-    score = min(score, 100)
+    score = max(0, min(score, 100))
     if score >= 85:
         move_potential = "VERY_HIGH"
         severity = "HIGH"

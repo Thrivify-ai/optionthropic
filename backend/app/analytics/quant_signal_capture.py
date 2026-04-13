@@ -41,7 +41,19 @@ _DEDUP_WINDOWS = {
     "QUICK": 90,
     "MAIN": 900,
 }
-_DECISION_DEDUP_SECONDS = 60
+_DECISION_DEDUP_SECONDS = {
+    "QUICK": 20,
+    "MAIN": 75,
+}
+_MAX_REASON_LENGTH = 500
+_TRADE_DECISION_SIGNALS = {
+    "Buy CE",
+    "Buy PE",
+    "Hold CE",
+    "Hold PE",
+    "Exit CE",
+    "Exit PE",
+}
 
 
 @dataclass
@@ -67,6 +79,19 @@ class QuantContextFields:
     short_covering_risk_score: int
     trap_score: int
     wall_shift_score: int
+
+
+def _fit_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    text = str(reason).strip()
+    if len(text) <= _MAX_REASON_LENGTH:
+        return text
+    return f"{text[: _MAX_REASON_LENGTH - 3].rstrip()}..."
+
+
+def _decision_dedup_seconds(engine: str) -> int:
+    return int(_DECISION_DEDUP_SECONDS.get(engine.upper(), 60))
 
 
 def _preferred_outcome(engine: str, row: QuantSignalOutcome) -> str:
@@ -304,7 +329,7 @@ async def record_shadow_decision(
     from sqlalchemy import desc, select
     from app.models.signal_shadow_decision import SignalShadowDecision
 
-    cutoff = generated_at - timedelta(seconds=_DECISION_DEDUP_SECONDS)
+    cutoff = generated_at - timedelta(seconds=_decision_dedup_seconds(engine))
     existing = (
         await session.execute(
             select(SignalShadowDecision)
@@ -323,7 +348,7 @@ async def record_shadow_decision(
     if existing is not None:
         existing.signal = signal
         existing.confidence = int(confidence)
-        existing.reason = reason
+        existing.reason = _fit_reason(reason)
         existing.outlook = outlook
         existing.state = state
         existing.entry_ready = bool(entry_ready)
@@ -362,7 +387,7 @@ async def record_shadow_decision(
         short_covering_risk_score=context.short_covering_risk_score,
         trap_score=context.trap_score,
         wall_shift_score=context.wall_shift_score,
-        reason=reason,
+        reason=_fit_reason(reason),
         generated_at=generated_at,
     )
     session.add(row)
@@ -443,7 +468,7 @@ async def record_quant_signal_candidate(
         selected_contract_quality=contract.quality,
         underlying_entry_price=round(float(underlying_entry_price), 2),
         option_entry_ltp=round(float(contract.last_price), 2) if contract.last_price is not None else None,
-        reason=reason,
+        reason=_fit_reason(reason),
         entry_time=entry_time,
     )
     session.add(row)
@@ -476,6 +501,12 @@ def derive_shadow_signal(
     if context.trap_score >= 60:
         adjusted -= 35
         reasons.append("trap risk is elevated")
+    if context.session_bucket == "MIDDAY" and engine.upper() == "QUICK":
+        adjusted -= 10
+        reasons.append("midday quick trades need stronger proof")
+    if context.regime_label in {"RANGE", "EXPIRY_PIN"}:
+        adjusted -= 10
+        reasons.append("regime quality is still poor")
     if context.expiry_bucket == "0DTE" and engine.upper() == "MAIN":
         adjusted -= 10
         reasons.append("same-day expiry adds noise")
@@ -485,9 +516,9 @@ def derive_shadow_signal(
     if signal in {"Buy CE", "Buy PE"}:
         if context.trap_score >= 60 or context.short_covering_risk_score >= 80:
             effective_signal = "Wait"
-        elif engine.upper() == "MAIN" and (not entry_ready or adjusted < 75):
+        elif engine.upper() == "MAIN" and (not entry_ready or adjusted < 82):
             effective_signal = "Wait"
-        elif engine.upper() == "QUICK" and adjusted < 78:
+        elif engine.upper() == "QUICK" and adjusted < 86:
             effective_signal = "Wait"
     elif raw_signal in {"Buy CE", "Buy PE"} and engine.upper() == "QUICK" and adjusted >= 82 and context.trap_score < 40:
         effective_signal = raw_signal
@@ -655,6 +686,8 @@ async def build_quant_signal_analytics_payload(
         grouped: dict[tuple[str, str], dict[str, Any]] = {}
         for row in decisions:
             if row.engine != engine:
+                continue
+            if row.signal not in _TRADE_DECISION_SIGNALS:
                 continue
             key = (row.signal_version, row.signal)
             bucket = grouped.setdefault(

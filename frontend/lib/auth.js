@@ -13,6 +13,7 @@ export function saveSession(tokenData) {
     localStorage.setItem(USER_KEY, JSON.stringify({
       id: tokenData.user_id,
       email: tokenData.email,
+      first_name: tokenData.first_name ?? null,
       plan: tokenData.plan,
       is_admin: tokenData.is_admin ?? false,
     }));
@@ -31,7 +32,16 @@ export function getToken() {
 export function getStoredUser() {
   if (typeof window === "undefined") return null;
   try {
-    return JSON.parse(localStorage.getItem(USER_KEY));
+    const raw = JSON.parse(localStorage.getItem(USER_KEY));
+    if (!raw) return null;
+    const email = typeof raw.email === "string" ? raw.email : "";
+    const derivedFirstName = email
+      ? email.split("@")[0].replace(/[._-]+/g, " ").trim().split(/\s+/)[0]
+      : "";
+    return {
+      ...raw,
+      first_name: raw.first_name || (derivedFirstName ? derivedFirstName.charAt(0).toUpperCase() + derivedFirstName.slice(1) : null),
+    };
   } catch {
     return null;
   }

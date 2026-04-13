@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alerts.global_news_scoring import NewsCandidate, parse_rss_items, score_news_candidate
@@ -31,7 +32,7 @@ async def _fetch_rss_candidates() -> list[NewsCandidate]:
         return []
 
     headers = {
-        "User-Agent": "OptionthropicNewsBot/1.0 (+https://optionthropic.io)",
+        "User-Agent": "OptionthropicNewsBot/1.0 (+https://optionthropic.com)",
     }
     timeout = httpx.Timeout(settings.global_news_timeout_seconds)
     candidates: list[NewsCandidate] = []
@@ -78,8 +79,8 @@ async def _latest_alert_rows(session: AsyncSession, limit: int | None = None) ->
                 GlobalNewsAlert.fetched_at >= cutoff,
             )
             .order_by(
-                desc(GlobalNewsAlert.impact_score),
                 desc(GlobalNewsAlert.published_at),
+                desc(GlobalNewsAlert.impact_score),
                 desc(GlobalNewsAlert.fetched_at),
             )
             .limit(limit_value)
@@ -99,34 +100,62 @@ async def _store_candidates(session: AsyncSession, candidates: list[NewsCandidat
         )
     ).scalars().all()
     existing = set(existing_rows)
+    now_utc = datetime.now(timezone.utc)
 
     for candidate in candidates:
-        scored = score_news_candidate(candidate)
+        scored = score_news_candidate(candidate, now_utc=now_utc)
         if not scored["is_critical"] or scored["dedupe_key"] in existing:
             continue
 
-        session.add(
-            GlobalNewsAlert(
-                provider=candidate.provider,
-                source=candidate.source[:200] if candidate.source else "Unknown",
-                title=candidate.title[:600],
-                summary=(candidate.summary or "")[:4000],
-                url=candidate.url,
-                published_at=candidate.published_at,
-                fetched_at=datetime.now(timezone.utc),
-                impact_score=scored["impact_score"],
-                move_potential=scored["move_potential"],
-                severity=scored["severity"],
-                affected_symbols=scored["affected_symbols"],
-                matched_themes=scored["matched_themes"],
-                impact_reason=scored["impact_reason"],
+        try:
+            async with session.begin_nested():
+                session.add(
+                    GlobalNewsAlert(
+                        provider=candidate.provider,
+                        source=candidate.source[:200] if candidate.source else "Unknown",
+                        title=candidate.title[:600],
+                        summary=(candidate.summary or "")[:4000],
+                        url=candidate.url,
+                        published_at=candidate.published_at,
+                        fetched_at=now_utc,
+                        impact_score=scored["impact_score"],
+                        move_potential=scored["move_potential"],
+                        severity=scored["severity"],
+                        affected_symbols=scored["affected_symbols"],
+                        matched_themes=scored["matched_themes"],
+                        impact_reason=scored["impact_reason"],
+                        dedupe_key=scored["dedupe_key"],
+                        is_critical=True,
+                    )
+                )
+                await session.flush()
+            existing.add(scored["dedupe_key"])
+        except IntegrityError:
+            logger.debug(
+                "Global news duplicate skipped",
+                title=candidate.title[:120],
                 dedupe_key=scored["dedupe_key"],
-                is_critical=True,
             )
-        )
-        existing.add(scored["dedupe_key"])
 
-    await session.flush()
+
+def _matches_requested_symbols(affected_symbols: list[str] | None, requested_symbols: set[str]) -> bool:
+    if not requested_symbols:
+        return True
+    affected = {str(item).upper() for item in (affected_symbols or [])}
+    return bool(affected & requested_symbols)
+
+
+async def list_recent_global_news_alerts(
+    session: AsyncSession,
+    *,
+    symbols: list[str] | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    limit_value = limit or settings.global_news_limit
+    requested_symbols = {str(symbol).upper() for symbol in (symbols or []) if symbol}
+    rows = await _latest_alert_rows(session, limit=max(limit_value * 4, settings.global_news_limit * 3))
+    filtered = [row for row in rows if _matches_requested_symbols(row.affected_symbols, requested_symbols)]
+    return [_serialize_alert_row(row) for row in filtered[:limit_value]]
 
 
 async def _cache_payload(payload: dict[str, Any], now_utc: datetime | None = None) -> None:

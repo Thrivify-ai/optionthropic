@@ -24,8 +24,15 @@ def serialize_trading_signal_payload(row: Any | None, trade: dict[str, Any] | No
             "state": "idle",
             "entry_ready": False,
             "reason": "No signal generated yet.",
+            "generated_at": None,
+            "freshness_seconds": None,
+            "stale": True,
             "trade": trade,
         }
+    generated_at = row.generated_at
+    if generated_at is not None and generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=timezone.utc)
+    freshness_seconds = int((datetime.now(timezone.utc) - generated_at).total_seconds()) if generated_at else None
     context = derive_signal_context(
         row.signal,
         row.bias_5m,
@@ -45,6 +52,9 @@ def serialize_trading_signal_payload(row: Any | None, trade: dict[str, Any] | No
         "state": context["state"],
         "entry_ready": context["entry_ready"],
         "reason": row.reason,
+        "generated_at": generated_at.isoformat() if generated_at else None,
+        "freshness_seconds": freshness_seconds,
+        "stale": bool(freshness_seconds is not None and freshness_seconds > 180),
         "trade": trade,
     }
 

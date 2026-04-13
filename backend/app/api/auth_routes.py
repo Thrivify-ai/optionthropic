@@ -59,6 +59,7 @@ class TokenResponse(BaseModel):
     expires_in: int
     user_id: str
     email: str
+    first_name: str | None = None
     plan: str
     is_admin: bool = False
 
@@ -66,6 +67,7 @@ class TokenResponse(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: str
+    first_name: str | None = None
     plan: str
     is_admin: bool
     created_at: datetime
@@ -87,6 +89,19 @@ def _verify_password(plain: str, hashed: str) -> bool:
 
 def _hash_password(plain: str) -> str:
     return pwd_context.hash(plain)
+
+
+def _first_name_from_email(email: str | None) -> str | None:
+    if not email:
+        return None
+    local_part = (email.split("@", 1)[0] or "").strip()
+    if not local_part:
+        return None
+    cleaned = local_part.replace(".", " ").replace("_", " ").replace("-", " ")
+    tokens = [token for token in cleaned.split() if token]
+    if not tokens:
+        return None
+    return tokens[0][:1].upper() + tokens[0][1:]
 
 
 # ─── Cognito helper ────────────────────────────────────────────────────────────
@@ -229,13 +244,19 @@ async def signup(
 
     token = _create_access_token(
         user.id,
-        {"email": user.email, "plan": user.plan.value, "is_admin": user.is_admin},
+        {
+            "email": user.email,
+            "first_name": _first_name_from_email(user.email),
+            "plan": user.plan.value,
+            "is_admin": user.is_admin,
+        },
     )
     return TokenResponse(
         access_token=token,
         expires_in=settings.access_token_expire_minutes * 60,
         user_id=user.id,
         email=user.email,
+        first_name=_first_name_from_email(user.email),
         plan=user.plan.value,
         is_admin=user.is_admin,
     )
@@ -274,13 +295,19 @@ async def login(
 
     token = _create_access_token(
         user.id,
-        {"email": user.email, "plan": user.plan.value, "is_admin": user.is_admin},
+        {
+            "email": user.email,
+            "first_name": _first_name_from_email(user.email),
+            "plan": user.plan.value,
+            "is_admin": user.is_admin,
+        },
     )
     return TokenResponse(
         access_token=token,
         expires_in=settings.access_token_expire_minutes * 60,
         user_id=user.id,
         email=user.email,
+        first_name=_first_name_from_email(user.email),
         plan=user.plan.value,
         is_admin=user.is_admin,
     )
@@ -291,6 +318,7 @@ async def me(current_user: Annotated[User, Depends(get_current_user)]) -> Any:
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
+        first_name=_first_name_from_email(current_user.email),
         plan=current_user.plan.value,
         is_admin=current_user.is_admin,
         created_at=current_user.created_at,

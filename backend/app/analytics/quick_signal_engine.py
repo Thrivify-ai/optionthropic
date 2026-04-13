@@ -20,6 +20,8 @@ from typing import Any, Optional
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analytics.main_signal_runtime import recent_news_impact_score
+from app.analytics.market_scanner import fetch_market_breadth_snapshot
 from app.analytics.quick_signal_phase2 import (
     BUY_SIGNALS,
     QuickSignalSessionProfile,
@@ -31,14 +33,19 @@ from app.analytics.quick_signal_phase2 import (
     serialize_lifecycle_state,
     session_profile_for,
 )
+from app.analytics.quick_signal_cache import cache_quick_signal_payload
 from app.analytics.trade_manager import (
     apply_managed_trade_decision,
+    stop_threshold_points,
+    success_threshold_points,
     serialize_trade_summary,
 )
 from app.analytics.quick_signal_utils import (
     has_directional_persistence,
     is_quick_rangebound,
 )
+from app.analytics.quant_signal_context import score_short_covering_risk
+from app.analytics.volatility_profile import load_intraday_volatility_profile, scale_threshold, scale_trade_thresholds
 from app.config import settings
 from app.logging_config import get_logger
 from app.models.chain_snapshot import ChainSnapshot
@@ -107,6 +114,7 @@ _DEFAULT_CONFIG: dict[str, float] = {
 _VOLUME_SPIKE_RATIO = 1.5
 _QUICK_SIGNAL_STATE_TTL_SECONDS = 1800
 _SNAPSHOT_MAX_AGE_SECONDS = 150
+_LIVE_SIGNAL_MAX_AGE_SECONDS = 75
 
 
 def _cfg(symbol: str) -> dict[str, float]:
@@ -114,11 +122,69 @@ def _cfg(symbol: str) -> dict[str, float]:
 
 
 def _state_key(symbol: str) -> str:
-    return f"quick-signal:lifecycle:{symbol.upper()}:v2"
+    return f"quick-signal:lifecycle:{symbol.upper()}:v4"
 
 
 def _timestamp_now(now_utc: datetime | None = None) -> str:
     return (now_utc or datetime.now(timezone.utc)).isoformat()
+
+
+def _pro_entry_filter_reason(
+    *,
+    direction: str,
+    profile_name: str,
+    momentum_1m: float,
+    momentum_3m: float | None,
+    mom_3m_threshold: float,
+    structural_break: bool,
+    fast_consensus: bool,
+    volume_spike: bool,
+    oi_confirmed: bool,
+    breadth_ok: bool,
+    news_impact_score: int,
+) -> str | None:
+    """
+    Final pro-style entry guard.
+
+    This blocks the classic bad scalps: chasing a one-minute bounce while the
+    three-minute structure is still against the trade, or entering on news risk
+    before price produces clean follow-through.
+    """
+    bullish = direction == "bullish"
+    same_direction_1m = momentum_1m > 0 if bullish else momentum_1m < 0
+    counter_3m = (
+        momentum_3m is not None
+        and (
+            momentum_3m <= -abs(mom_3m_threshold)
+            if bullish
+            else momentum_3m >= abs(mom_3m_threshold)
+        )
+    )
+    reversal_exception = (
+        structural_break
+        and same_direction_1m
+        and fast_consensus
+        and volume_spike
+        and (oi_confirmed or breadth_ok)
+    )
+
+    if not same_direction_1m:
+        side = "bullish" if bullish else "bearish"
+        return f"Entry blocked: 1m tape is not {side}; refusing to chase a stale impulse."
+
+    if counter_3m and not reversal_exception:
+        return "Entry blocked: 3m structure is still countertrend; waiting for a confirmed reversal instead of a bounce chase."
+
+    if news_impact_score >= 85 and not (
+        structural_break
+        or (fast_consensus and volume_spike and (oi_confirmed or breadth_ok))
+    ):
+        return "Entry blocked: news risk is elevated but tradeable price follow-through is not confirmed."
+
+    if profile_name == "closing" and news_impact_score >= 85 and not structural_break and not fast_consensus:
+        return "Entry blocked: late-session news tape needs a structural break or fast-tape consensus."
+
+    return None
 
 
 def _wait_payload(
@@ -143,6 +209,15 @@ def _wait_payload(
     rangebound: bool = False,
     call_oi_delta: Optional[float] = None,
     put_oi_delta: Optional[float] = None,
+    confirmation_count: int = 0,
+    required_confirmations: int = 0,
+    breadth_score: Optional[int] = None,
+    breadth_reason: str | None = None,
+    volatility_ratio: float | None = None,
+    news_impact_score: int = 0,
+    no_trade_regime: str | None = None,
+    managed_success_threshold_points: float | None = None,
+    managed_stop_points: float | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "symbol": symbol,
@@ -158,6 +233,8 @@ def _wait_payload(
         "resistance": resistance,
         "reason": reason,
         "confidence": int(confidence),
+        "confirmation_count": int(confirmation_count),
+        "required_confirmations": int(required_confirmations),
         "risk_reward_ok": bool(risk_reward_ok_flag),
         "risk_reward_reason": risk_reward_reason,
         "trap_detected": bool(trap_detected),
@@ -170,6 +247,20 @@ def _wait_payload(
         payload["call_oi_delta"] = round(call_oi_delta, 2)
     if put_oi_delta is not None:
         payload["put_oi_delta"] = round(put_oi_delta, 2)
+    if breadth_score is not None:
+        payload["breadth_score"] = int(breadth_score)
+    if breadth_reason:
+        payload["breadth_reason"] = breadth_reason
+    if volatility_ratio is not None:
+        payload["volatility_ratio"] = round(float(volatility_ratio), 2)
+    if news_impact_score:
+        payload["news_impact_score"] = int(news_impact_score)
+    if no_trade_regime:
+        payload["no_trade_regime"] = no_trade_regime
+    if managed_success_threshold_points is not None:
+        payload["managed_success_threshold_points"] = round(float(managed_success_threshold_points), 2)
+    if managed_stop_points is not None:
+        payload["managed_stop_points"] = round(float(managed_stop_points), 2)
     return payload
 
 
@@ -251,6 +342,9 @@ async def _apply_trade_management_overlay(
         now_utc=now_utc,
         hard_exit=hard_exit,
         hard_exit_reason=hard_exit_reason,
+        success_threshold_override=float(payload["managed_success_threshold_points"]) if payload.get("managed_success_threshold_points") is not None else None,
+        stop_points_override=float(payload["managed_stop_points"]) if payload.get("managed_stop_points") is not None else None,
+        signal_version="quick_v4_live",
     )
 
     payload["base_quick_signal"] = base_signal
@@ -274,7 +368,7 @@ async def _apply_trade_management_overlay(
     )
     payload["management_reason"] = decision.management_reason
     payload["trade"] = serialize_trade_summary(trade_row)
-    if decision.action in {"hold", "exit"}:
+    if decision.action in {"hold", "exit"} or (decision.action == "wait" and base_signal in {"Buy CE", "Buy PE"}):
         payload["reason"] = decision.management_reason
     return payload
 
@@ -387,10 +481,55 @@ def _target_move(cfg: dict[str, float]) -> int:
     return int(cfg.get("target_move", 40))
 
 
+def _dynamic_target_move(
+    cfg: dict[str, float],
+    volatility_ratio: float | None,
+    avg_abs_move_1m: float | None,
+) -> int:
+    base_target = float(_target_move(cfg))
+    if avg_abs_move_1m is None:
+        return int(base_target)
+    dynamic = max(base_target * 0.85, min(base_target * 1.6, avg_abs_move_1m * 3.4))
+    if volatility_ratio is not None and volatility_ratio >= 1.25:
+        dynamic *= 1.08
+    return int(round(dynamic))
+
+
+def _breadth_alignment(snapshot: Any, direction: str, *, min_score: int) -> tuple[bool, str]:
+    if not getattr(snapshot, "available", False):
+        return True, "Breadth scanner unavailable, so no internal leadership block was applied."
+    score = int(getattr(snapshot, "breadth_score", 0) or 0)
+    if direction == "bullish":
+        aligned = score >= min_score and bool(getattr(snapshot, "aligned_bullish", False))
+    else:
+        aligned = score <= -min_score and bool(getattr(snapshot, "aligned_bearish", False))
+    return aligned, str(getattr(snapshot, "reason", "Breadth alignment checked."))
+
+
 def _tick_momentum(symbol: str, seconds: int, current_price: float | None) -> float | None:
     if current_price is None:
         return None
     price_then = get_price_seconds_ago(symbol, seconds)
+    if price_then is None:
+        return None
+    return round(float(current_price) - float(price_then), 2)
+
+
+def _adaptive_tick_momentum(
+    symbol: str,
+    seconds: int,
+    current_price: float | None,
+    *,
+    tolerance_seconds: int,
+) -> float | None:
+    """Retry momentum lookup with wider tolerance when tick sampling is uneven."""
+    if current_price is None:
+        return None
+    price_then = get_price_seconds_ago(
+        symbol,
+        seconds,
+        tolerance_seconds=max(3, int(tolerance_seconds)),
+    )
     if price_then is None:
         return None
     return round(float(current_price) - float(price_then), 2)
@@ -448,11 +587,21 @@ def _signal_payload(
     reason: str,
     call_oi_delta: float,
     put_oi_delta: float,
+    confirmation_count: int,
+    required_confirmations: int,
+    breadth_score: int | None = None,
+    breadth_reason: str | None = None,
+    volatility_ratio: float | None = None,
+    news_impact_score: int = 0,
+    managed_success_threshold_points: float | None = None,
+    managed_stop_points: float | None = None,
+    signal_type: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "symbol": symbol,
         "quick_signal": signal,
         "raw_signal": signal,
+        "signal_type": signal_type or "standard",
         "momentum": momentum_1m,
         "momentum_3m": momentum_3m,
         "volume_spike": bool(volume_spike),
@@ -464,6 +613,8 @@ def _signal_payload(
         "current_price": round(spot, 2),
         "target_move_points": target_move,
         "confidence": int(confidence),
+        "confirmation_count": int(confirmation_count),
+        "required_confirmations": int(required_confirmations),
         "risk_reward_ok": bool(risk_reward_ok_flag),
         "risk_reward_reason": risk_reward_reason,
         "trap_detected": bool(trap_detected),
@@ -473,6 +624,19 @@ def _signal_payload(
         "reason": reason,
         "timestamp": _timestamp_now(now_utc),
     }
+    if breadth_score is not None:
+        payload["breadth_score"] = int(breadth_score)
+    if breadth_reason:
+        payload["breadth_reason"] = breadth_reason
+    if volatility_ratio is not None:
+        payload["volatility_ratio"] = round(float(volatility_ratio), 2)
+    if news_impact_score:
+        payload["news_impact_score"] = int(news_impact_score)
+    if managed_success_threshold_points is not None:
+        payload["managed_success_threshold_points"] = round(float(managed_success_threshold_points), 2)
+    if managed_stop_points is not None:
+        payload["managed_stop_points"] = round(float(managed_stop_points), 2)
+    return payload
 
 
 async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[str, Any]:
@@ -502,12 +666,14 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             data_key=data_key,
             fast_track=fast_track,
         )
-        return await _apply_trade_management_overlay(
+        finalized = await _apply_trade_management_overlay(
             session,
             symbol,
             finalized,
             now_utc=now_utc,
         )
+        await cache_quick_signal_payload(symbol, finalized)
+        return finalized
 
     if profile.name == "closed":
         payload = _wait_payload(
@@ -517,15 +683,14 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         )
         return await _finish(payload, hard_invalidation=False, data_key=f"closed:{symbol}")
 
-    bull_mom = adjusted_threshold(cfg["bull_mom"], profile)
-    bear_mom = -adjusted_threshold(abs(cfg["bear_mom"]), profile)
-    mom_3m_thresh = adjusted_threshold(cfg["mom_3m"], profile)
-    fast_10s_thresh = adjusted_threshold(cfg["fast_10s"], profile)
-    fast_20s_thresh = adjusted_threshold(cfg["fast_20s"], profile)
-    fast_60s_thresh = adjusted_threshold(cfg["fast_60s"], profile)
+    base_bull_mom = adjusted_threshold(cfg["bull_mom"], profile)
+    base_bear_mom = -adjusted_threshold(abs(cfg["bear_mom"]), profile)
+    base_mom_3m_thresh = adjusted_threshold(cfg["mom_3m"], profile)
+    base_fast_10s_thresh = adjusted_threshold(cfg["fast_10s"], profile)
+    base_fast_20s_thresh = adjusted_threshold(cfg["fast_20s"], profile)
+    base_fast_60s_thresh = adjusted_threshold(cfg["fast_60s"], profile)
     pct_min = cfg["pct_min"] * profile.threshold_multiplier * 100
     soft_ratio = float(cfg.get("soft_ratio", 0.5))
-    target_move = _target_move(cfg)
 
     timestamps = await _latest_timestamps(session, symbol, n=7)
     if len(timestamps) < 2:
@@ -582,11 +747,54 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
     )
     spot = tick_price if tick_fresh and tick_price is not None else curr["price"]
     data_source = "tick" if tick_fresh and tick_timestamp else "snapshot"
+    signal_data_fresh = bool(tick_fresh or snapshot_age_seconds <= _LIVE_SIGNAL_MAX_AGE_SECONDS)
     data_key = (
         f"{symbol}:{tick_timestamp}:{ts_now.isoformat()}"
         if tick_fresh and tick_timestamp
         else f"{symbol}:{ts_now.isoformat()}"
     )
+
+    if not signal_data_fresh:
+        payload = _wait_payload(
+            symbol,
+            "Quick setup skipped because the latest tape is stale. Waiting for a fresh market update.",
+            now_utc=now_utc,
+            current_price=spot,
+            confidence=0,
+            confirmation_count=0,
+            required_confirmations=profile.min_confirmation_count,
+        )
+        payload = _attach_fast_metrics(
+            payload,
+            momentum_10s=None,
+            momentum_20s=None,
+            momentum_60s=None,
+            data_source=data_source,
+            price_age_seconds=tick_age_seconds,
+            snapshot_age_seconds=snapshot_age_seconds,
+        )
+        return await _finish(payload, hard_invalidation=False, data_key=data_key)
+
+    volatility_profile = await load_intraday_volatility_profile(session, symbol)
+    volatility_ratio = (
+        float(volatility_profile.ratio_to_baseline)
+        if volatility_profile is not None
+        else 1.0
+    )
+    bull_mom = scale_threshold(base_bull_mom, volatility_profile, multiplier=1.2)
+    bear_mom = -scale_threshold(abs(base_bear_mom), volatility_profile, multiplier=1.2)
+    mom_3m_thresh = scale_threshold(base_mom_3m_thresh, volatility_profile, multiplier=1.85)
+    fast_10s_thresh = scale_threshold(base_fast_10s_thresh, volatility_profile, multiplier=0.9)
+    fast_20s_thresh = scale_threshold(base_fast_20s_thresh, volatility_profile, multiplier=1.25)
+    fast_60s_thresh = scale_threshold(base_fast_60s_thresh, volatility_profile, multiplier=2.3)
+    target_move = _dynamic_target_move(
+        cfg,
+        volatility_ratio,
+        float(volatility_profile.avg_abs_move_1m) if volatility_profile is not None else None,
+    )
+    breadth_snapshot = await fetch_market_breadth_snapshot(symbol)
+    breadth_score = int(breadth_snapshot.breadth_score or 0)
+    news_impact_score = await recent_news_impact_score(session, symbol, now_utc)
 
     support, resistance = await _support_resistance(
         session,
@@ -601,6 +809,20 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
     price_20s = _tick_momentum(symbol, 20, spot) if tick_fresh else None
     price_60s = _tick_momentum(symbol, 60, spot) if tick_fresh else None
     price_180s = _tick_momentum(symbol, 180, spot) if tick_fresh else None
+    if tick_fresh and price_60s is None:
+        price_60s = _adaptive_tick_momentum(
+            symbol,
+            60,
+            spot,
+            tolerance_seconds=max(55, settings.fast_tick_poll_seconds * 18),
+        )
+    if tick_fresh and price_180s is None:
+        price_180s = _adaptive_tick_momentum(
+            symbol,
+            180,
+            spot,
+            tolerance_seconds=max(95, settings.fast_tick_poll_seconds * 34),
+        )
 
     momentum_1m = round(spot - prev_1m["price"], 2)
     momentum_3m = None
@@ -705,6 +927,77 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
 
     strong_bullish_3m = momentum_3m is not None and momentum_3m >= mom_3m_thresh
     strong_bearish_3m = momentum_3m is not None and momentum_3m <= -mom_3m_thresh
+    breadth_bullish_ok, breadth_bullish_reason = _breadth_alignment(
+        breadth_snapshot,
+        "bullish",
+        min_score=profile.min_breadth_score,
+    )
+    breadth_bearish_ok, breadth_bearish_reason = _breadth_alignment(
+        breadth_snapshot,
+        "bearish",
+        min_score=profile.min_breadth_score,
+    )
+    short_covering_risk_bull = score_short_covering_risk(
+        signal="Buy CE",
+        call_oi_delta=call_oi_delta,
+        put_oi_delta=put_oi_delta,
+        breakout=bullish_breakout,
+        breakdown=False,
+        volume_spike=volume_spike,
+        writer_support=bool(oi_bullish or breadth_bullish_ok),
+    )
+    short_covering_risk_bear = score_short_covering_risk(
+        signal="Buy PE",
+        call_oi_delta=call_oi_delta,
+        put_oi_delta=put_oi_delta,
+        breakout=False,
+        breakdown=bearish_breakdown,
+        volume_spike=volume_spike,
+        writer_support=bool(oi_bearish or breadth_bearish_ok),
+    )
+    bullish_confirmation_count = sum(
+        1
+        for flag in (
+            bullish_breakout,
+            volume_spike,
+            oi_bullish,
+            strong_bullish_3m,
+            fast_bullish_consensus,
+            breadth_bullish_ok,
+        )
+        if flag
+    )
+    required_confirmations = int(profile.min_confirmation_count)
+    scalp_bullish_impulse = (
+        profile.name in {"opening", "closing"}
+        and tick_fresh
+        and fast_bullish
+        and (bullish_breakout or volume_spike)
+        and (oi_bullish or breadth_bullish_ok)
+    )
+    scalp_bearish_impulse = (
+        profile.name in {"opening", "closing"}
+        and tick_fresh
+        and fast_bearish
+        and (bearish_breakdown or volume_spike)
+        and (oi_bearish or breadth_bearish_ok)
+    )
+    if scalp_bullish_impulse or scalp_bearish_impulse:
+        required_confirmations = max(3, required_confirmations - 1)
+    if news_impact_score >= 85 and profile.name == "midday":
+        required_confirmations += 1
+    bearish_confirmation_count = sum(
+        1
+        for flag in (
+            bearish_breakdown,
+            volume_spike,
+            oi_bearish,
+            strong_bearish_3m,
+            fast_bearish_consensus,
+            breadth_bearish_ok,
+        )
+        if flag
+    )
 
     rangebound = is_quick_rangebound(
         spot,
@@ -715,7 +1008,26 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         bull_mom,
         mom_3m_thresh,
     )
-    hard_invalidation = bool(trap_bull or trap_bear or rangebound)
+    structure_snapshot_stale = snapshot_age_seconds > _SNAPSHOT_MAX_AGE_SECONDS
+    tick_impulse_override = bool(
+        tick_fresh
+        and structure_snapshot_stale
+        and (
+            (
+                momentum_1m >= bull_mom * 0.85
+                and (price_10s is None or price_10s > 0)
+                and (price_20s is None or price_20s > 0)
+            )
+            or (
+                momentum_1m <= bear_mom * 0.85
+                and (price_10s is None or price_10s < 0)
+                and (price_20s is None or price_20s < 0)
+            )
+        )
+    )
+    if rangebound and tick_impulse_override:
+        rangebound = False
+    hard_invalidation = bool(trap_bull or trap_bear or (rangebound and not tick_impulse_override))
 
     bullish_trend_ok = (
         (strong_bullish and (momentum_3m is None or momentum_3m > 0))
@@ -728,11 +1040,10 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         or (fast_bearish and fast_bearish_consensus)
     )
 
-    snapshot_fresh = snapshot_age_seconds <= _SNAPSHOT_MAX_AGE_SECONDS
-    has_bull_conf = bullish_breakout or volume_spike or oi_bullish or (fast_bullish and snapshot_fresh)
-    has_bear_conf = bearish_breakdown or volume_spike or oi_bearish or (fast_bearish and snapshot_fresh)
-    soft_bull_ok = soft_bull and (momentum_3m is None or momentum_3m > 0) and has_bull_conf
-    soft_bear_ok = soft_bear and (momentum_3m is None or momentum_3m < 0) and has_bear_conf
+    has_bull_conf = bullish_confirmation_count >= max(2, required_confirmations - 1)
+    has_bear_conf = bearish_confirmation_count >= max(2, required_confirmations - 1)
+    soft_bull_ok = profile.allow_soft_entries and soft_bull and (momentum_3m is None or momentum_3m > 0) and has_bull_conf
+    soft_bear_ok = profile.allow_soft_entries and soft_bear and (momentum_3m is None or momentum_3m < 0) and has_bear_conf
 
     bullish_persistent = has_directional_persistence(
         momentum_1m,
@@ -745,8 +1056,145 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         "bearish",
     ) or fast_bearish_consensus
 
-    bullish_ready = (bullish_trend_ok or soft_bull_ok) and bullish_persistent and not trap_bull
-    bearish_ready = (bearish_trend_ok or soft_bear_ok) and bearish_persistent and not trap_bear
+    midday_compression = (
+        profile.name == "midday"
+        and rangebound
+        and not volume_spike
+        and abs(momentum_1m) < max(abs(bull_mom), abs(bear_mom)) * 1.15
+    )
+    low_volatility_compression = (
+        volatility_ratio is not None
+        and volatility_ratio < 0.72
+        and not volume_spike
+        and not bullish_breakout
+        and not bearish_breakdown
+    )
+    stale_snapshot_context = (
+        not tick_fresh
+        and snapshot_age_seconds > 75
+    )
+    news_without_followthrough = (
+        news_impact_score >= 85
+        and not volume_spike
+        and not bullish_breakout
+        and not bearish_breakdown
+        and abs(momentum_1m) < max(abs(bull_mom), abs(bear_mom)) * 1.2
+    )
+    weak_breadth_divergence = (
+        breadth_snapshot.available
+        and (
+            (strong_bullish and breadth_score <= -profile.min_breadth_score)
+            or (strong_bearish and breadth_score >= profile.min_breadth_score)
+        )
+    )
+    regime_block_reason = None
+    if midday_compression:
+        regime_block_reason = "midday range compression is still dominating"
+    elif low_volatility_compression:
+        regime_block_reason = "intraday volatility is compressed; waiting for a cleaner expansion regime"
+    elif stale_snapshot_context:
+        regime_block_reason = "market snapshot is stale and tick stream is not fresh enough for quick execution"
+    elif news_without_followthrough:
+        regime_block_reason = "news risk is elevated but price has not produced follow-through yet"
+    elif weak_breadth_divergence:
+        regime_block_reason = "index breadth is diverging from the impulse"
+
+    bullish_entry_blocked = (
+        (profile.requires_breakout and not bullish_breakout)
+        or short_covering_risk_bull >= 62
+        or regime_block_reason is not None
+        or not breadth_bullish_ok
+    )
+    bearish_entry_blocked = (
+        (profile.requires_breakout and not bearish_breakdown)
+        or short_covering_risk_bear >= 62
+        or regime_block_reason is not None
+        or not breadth_bearish_ok
+    )
+
+    bullish_ready_base = (
+        (bullish_trend_ok or soft_bull_ok)
+        and bullish_persistent
+        and strong_bullish
+        and (strong_bullish_3m or fast_bullish)
+        and not trap_bull
+        and not bullish_entry_blocked
+        and bullish_confirmation_count >= required_confirmations
+    )
+    bearish_ready_base = (
+        (bearish_trend_ok or soft_bear_ok)
+        and bearish_persistent
+        and strong_bearish
+        and (strong_bearish_3m or fast_bearish)
+        and not trap_bear
+        and not bearish_entry_blocked
+        and bearish_confirmation_count >= required_confirmations
+    )
+    extreme_impulse_threshold = max(abs(bull_mom), abs(bear_mom)) * (1.45 if profile.name == "midday" else 1.3)
+    impulse_bullish_ready = (
+        momentum_1m >= extreme_impulse_threshold
+        and tick_fresh
+        and (fast_bullish or fast_bullish_consensus)
+        and (
+            bullish_breakout
+            or strong_bullish_3m
+            or (momentum_3m is not None and momentum_3m > 0)
+            or (
+                price_20s is not None
+                and price_10s is not None
+                and price_20s >= fast_20s_thresh * 1.1
+                and price_10s >= fast_10s_thresh * 1.1
+            )
+        )
+        and not trap_bull
+        and short_covering_risk_bull < 70
+        and (
+            breadth_bullish_ok
+            or not breadth_snapshot.available
+            or (structure_snapshot_stale and momentum_1m >= extreme_impulse_threshold * 1.12)
+        )
+        and bullish_confirmation_count >= max(2, required_confirmations - 2)
+    )
+    impulse_bearish_ready = (
+        momentum_1m <= -extreme_impulse_threshold
+        and tick_fresh
+        and (fast_bearish or fast_bearish_consensus)
+        and (
+            bearish_breakdown
+            or strong_bearish_3m
+            or (momentum_3m is not None and momentum_3m < 0)
+            or (
+                price_20s is not None
+                and price_10s is not None
+                and price_20s <= -fast_20s_thresh * 1.1
+                and price_10s <= -fast_10s_thresh * 1.1
+            )
+        )
+        and not trap_bear
+        and short_covering_risk_bear < 70
+        and (
+            breadth_bearish_ok
+            or not breadth_snapshot.available
+            or (structure_snapshot_stale and momentum_1m <= -extreme_impulse_threshold * 1.12)
+        )
+        and bearish_confirmation_count >= max(2, required_confirmations - 2)
+    )
+    bullish_ready = bullish_ready_base or impulse_bullish_ready
+    bearish_ready = bearish_ready_base or impulse_bearish_ready
+    bullish_signal_type = (
+        "impulse_scalp"
+        if impulse_bullish_ready and not bullish_ready_base
+        else "structure_breakout"
+        if bullish_breakout
+        else "trend_continuation"
+    )
+    bearish_signal_type = (
+        "impulse_scalp"
+        if impulse_bearish_ready and not bearish_ready_base
+        else "structure_breakdown"
+        if bearish_breakdown
+        else "trend_continuation"
+    )
 
     bullish_rr_ok, bullish_rr_reason = reward_risk_ok(
         "Buy CE",
@@ -777,9 +1225,17 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         volume_spike=volume_spike,
         oi_confirmed=oi_bullish,
         persistent=bullish_persistent,
+        confirmation_count=bullish_confirmation_count,
+        fresh_data=signal_data_fresh,
         trap=trap_bull,
         rangebound=rangebound,
         risk_reward_ok=bullish_rr_ok,
+        breadth_aligned=breadth_bullish_ok,
+        breadth_score=breadth_score,
+        short_covering_risk=short_covering_risk_bull,
+        volatility_ratio=volatility_ratio,
+        session_name=profile.name,
+        regime_blocked=regime_block_reason is not None and not impulse_bullish_ready,
     )
     if fast_bullish and tick_fresh:
         bullish_confidence = min(100, bullish_confidence + 8)
@@ -793,17 +1249,102 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         volume_spike=volume_spike,
         oi_confirmed=oi_bearish,
         persistent=bearish_persistent,
+        confirmation_count=bearish_confirmation_count,
+        fresh_data=signal_data_fresh,
         trap=trap_bear,
         rangebound=rangebound,
         risk_reward_ok=bearish_rr_ok,
+        breadth_aligned=breadth_bearish_ok,
+        breadth_score=breadth_score,
+        short_covering_risk=short_covering_risk_bear,
+        volatility_ratio=volatility_ratio,
+        session_name=profile.name,
+        regime_blocked=regime_block_reason is not None and not impulse_bearish_ready,
     )
     if fast_bearish and tick_fresh:
         bearish_confidence = min(100, bearish_confidence + 8)
 
+    managed_success_threshold, managed_stop_points = scale_trade_thresholds(
+        base_success=success_threshold_points("QUICK", symbol),
+        base_stop=stop_threshold_points("QUICK", symbol),
+        volatility_ratio=volatility_ratio,
+        event_risk=news_impact_score >= 85,
+    )
+
     bullish_live = bullish_ready and bullish_rr_ok and bullish_confidence >= profile.min_confidence
     bearish_live = bearish_ready and bearish_rr_ok and bearish_confidence >= profile.min_confidence
-    bullish_fast_track = bullish_live and fast_bullish and tick_fresh and bullish_confidence >= profile.min_confidence + 6
-    bearish_fast_track = bearish_live and fast_bearish and tick_fresh and bearish_confidence >= profile.min_confidence + 6
+    entry_gate_reason = None
+    bullish_entry_gate_reason = None
+    bearish_entry_gate_reason = None
+    price_dislocation = abs(float(spot) - float(curr["price"]))
+    if bullish_live or bearish_live:
+        if profile.name == "midday" and max(bullish_confidence, bearish_confidence) < 92:
+            entry_gate_reason = "midday tape is still noisy; fresh entries require near-perfect conviction"
+        elif volatility_ratio is not None and volatility_ratio < 0.80:
+            entry_gate_reason = "intraday volatility is too compressed for a clean quick entry"
+        elif (
+            volatility_ratio is not None
+            and volatility_ratio > 1.75
+            and max(bullish_confidence, bearish_confidence) < profile.min_confidence + 5
+        ):
+            entry_gate_reason = "tape is hyper-volatile; waiting for cleaner continuation before entry"
+        elif tick_fresh and price_dislocation > max(6.0, target_move * 0.18):
+            entry_gate_reason = "price dislocation is elevated; waiting for tape and snapshot to re-align"
+    if entry_gate_reason and not (impulse_bullish_ready or impulse_bearish_ready):
+        bullish_live = False
+        bearish_live = False
+
+    if bullish_live:
+        bullish_entry_gate_reason = _pro_entry_filter_reason(
+            direction="bullish",
+            profile_name=profile.name,
+            momentum_1m=momentum_1m,
+            momentum_3m=momentum_3m,
+            mom_3m_threshold=mom_3m_thresh,
+            structural_break=bullish_breakout,
+            fast_consensus=fast_bullish_consensus,
+            volume_spike=volume_spike,
+            oi_confirmed=oi_bullish,
+            breadth_ok=breadth_bullish_ok,
+            news_impact_score=news_impact_score,
+        )
+        if bullish_entry_gate_reason:
+            bullish_live = False
+            entry_gate_reason = bullish_entry_gate_reason
+    if bearish_live:
+        bearish_entry_gate_reason = _pro_entry_filter_reason(
+            direction="bearish",
+            profile_name=profile.name,
+            momentum_1m=momentum_1m,
+            momentum_3m=momentum_3m,
+            mom_3m_threshold=mom_3m_thresh,
+            structural_break=bearish_breakdown,
+            fast_consensus=fast_bearish_consensus,
+            volume_spike=volume_spike,
+            oi_confirmed=oi_bearish,
+            breadth_ok=breadth_bearish_ok,
+            news_impact_score=news_impact_score,
+        )
+        if bearish_entry_gate_reason:
+            bearish_live = False
+            entry_gate_reason = bearish_entry_gate_reason
+
+    bullish_fast_track = (
+        bullish_live
+        and fast_bullish
+        and tick_fresh
+        and bullish_confirmation_count >= 2
+        and breadth_bullish_ok
+        and bullish_confidence >= profile.min_confidence + 4
+    )
+    bearish_fast_track = (
+        bearish_live
+        and fast_bearish
+        and tick_fresh
+        and bearish_confirmation_count >= 2
+        and breadth_bearish_ok
+        and bearish_confidence >= profile.min_confidence + 4
+    )
 
     if bullish_live and not bearish_live:
         ext: list[str] = []
@@ -811,10 +1352,14 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             ext.append(f"breakout above {int(resistance):,}")
         if oi_bullish:
             ext.append("call covering with put support")
+        if breadth_bullish_ok and breadth_snapshot.available:
+            ext.append(f"breadth {breadth_score:+d}")
         if volume_spike:
             ext.append("volume expansion")
         if fast_bullish and price_10s is not None:
             ext.append(f"fast tape +{price_10s:.0f} in 10s")
+        if news_impact_score >= 85:
+            ext.append(f"news impact {news_impact_score}")
         ext.append(bullish_rr_reason)
         reason = (
             f"+{momentum_1m:.0f} pts in 1m"
@@ -843,6 +1388,15 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             reason=reason,
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
+            confirmation_count=bullish_confirmation_count,
+            required_confirmations=required_confirmations,
+            breadth_score=breadth_score,
+            breadth_reason=breadth_bullish_reason,
+            volatility_ratio=volatility_ratio,
+            news_impact_score=news_impact_score,
+            managed_success_threshold_points=managed_success_threshold,
+            managed_stop_points=managed_stop_points,
+            signal_type=bullish_signal_type,
         )
         payload = _attach_fast_metrics(
             payload,
@@ -866,10 +1420,14 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             ext.append(f"breakdown below {int(support):,}")
         if oi_bearish:
             ext.append("put covering with call pressure")
+        if breadth_bearish_ok and breadth_snapshot.available:
+            ext.append(f"breadth {breadth_score:+d}")
         if volume_spike:
             ext.append("volume expansion")
         if fast_bearish and price_10s is not None:
             ext.append(f"fast tape {price_10s:.0f} in 10s")
+        if news_impact_score >= 85:
+            ext.append(f"news impact {news_impact_score}")
         ext.append(bearish_rr_reason)
         reason = (
             f"{momentum_1m:.0f} pts in 1m"
@@ -898,6 +1456,15 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             reason=reason,
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
+            confirmation_count=bearish_confirmation_count,
+            required_confirmations=required_confirmations,
+            breadth_score=breadth_score,
+            breadth_reason=breadth_bearish_reason,
+            volatility_ratio=volatility_ratio,
+            news_impact_score=news_impact_score,
+            managed_success_threshold_points=managed_success_threshold,
+            managed_stop_points=managed_stop_points,
+            signal_type=bearish_signal_type,
         )
         payload = _attach_fast_metrics(
             payload,
@@ -938,6 +1505,14 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             rangebound=rangebound,
             call_oi_delta=call_oi_delta,
             put_oi_delta=put_oi_delta,
+            confirmation_count=max(bullish_confirmation_count, bearish_confirmation_count),
+            required_confirmations=required_confirmations,
+            breadth_score=breadth_score,
+            breadth_reason=breadth_snapshot.reason,
+            volatility_ratio=volatility_ratio,
+            news_impact_score=news_impact_score,
+            managed_success_threshold_points=managed_success_threshold,
+            managed_stop_points=managed_stop_points,
         )
         payload = _attach_fast_metrics(
             payload,
@@ -966,6 +1541,10 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             wait_reasons.append("trap risk is elevated after a failed move")
         if rangebound:
             wait_reasons.append("price is still rangebound inside support and resistance")
+    elif entry_gate_reason:
+        wait_reasons.append(entry_gate_reason)
+    elif regime_block_reason:
+        wait_reasons.append(regime_block_reason)
     elif bullish_ready or bearish_ready:
         if not rr_ok:
             wait_reasons.append(rr_reason)
@@ -981,6 +1560,17 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             if price_10s is not None and price_20s is not None:
                 msg += f"; 10s {price_10s:+.0f}; 20s {price_20s:+.0f}"
             wait_reasons.append(f"momentum is below the required session-adjusted threshold ({msg})")
+        elif ((bullish_trend_ok or soft_bull_ok) and bullish_confirmation_count < required_confirmations) or (
+            (bearish_trend_ok or soft_bear_ok) and bearish_confirmation_count < required_confirmations
+        ):
+            if bullish_confirmation_count >= bearish_confirmation_count:
+                wait_reasons.append(
+                    f"bullish tape exists, but only {bullish_confirmation_count}/{required_confirmations} confirmations are present"
+                )
+            else:
+                wait_reasons.append(
+                    f"bearish tape exists, but only {bearish_confirmation_count}/{required_confirmations} confirmations are present"
+                )
         elif (soft_bull and not has_bull_conf) or (soft_bear and not has_bear_conf):
             wait_reasons.append("momentum appeared, but breakout, volume, or OI confirmation is still missing")
         elif momentum_3m is not None and (
@@ -992,6 +1582,13 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
             (bearish_trend_ok or soft_bear_ok) and not bearish_persistent
         ):
             wait_reasons.append("direction has not persisted across the prior momentum leg")
+        elif breadth_snapshot.available and (
+            (strong_bullish and not breadth_bullish_ok)
+            or (strong_bearish and not breadth_bearish_ok)
+        ):
+            wait_reasons.append("internal breadth and leadership are not aligned with the impulse")
+        elif short_covering_risk_bull >= 62 or short_covering_risk_bear >= 62:
+            wait_reasons.append("OI still looks more like covering than fresh conviction")
         else:
             wait_reasons.append("no quick setup currently meets activation standards")
 
@@ -1015,6 +1612,15 @@ async def run_quick_signal_engine(session: AsyncSession, symbol: str) -> dict[st
         rangebound=rangebound,
         call_oi_delta=call_oi_delta,
         put_oi_delta=put_oi_delta,
+        confirmation_count=max(bullish_confirmation_count, bearish_confirmation_count),
+        required_confirmations=required_confirmations,
+        breadth_score=breadth_score,
+        breadth_reason=breadth_snapshot.reason,
+        volatility_ratio=volatility_ratio,
+        news_impact_score=news_impact_score,
+        no_trade_regime=entry_gate_reason or regime_block_reason,
+        managed_success_threshold_points=managed_success_threshold,
+        managed_stop_points=managed_stop_points,
     )
     payload = _attach_fast_metrics(
         payload,

@@ -12,20 +12,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai_engine.market_explainer import explain_market
 from app.alerts.alert_engine import run_alert_evaluation
+from app.alerts.global_news import get_global_news_alerts_payload, list_recent_global_news_alerts
 from app.analytics.dashboard_cache import get_dashboard_overview
 from app.analytics.dashboard_view_utils import serialize_trading_signal_payload
 from app.analytics.gamma_detection import compute_gamma_walls
 from app.analytics.liquidity_trap_detection import detect_liquidity_traps
+from app.analytics.market_scanner import fetch_market_breadth_snapshot
+from app.analytics.market_sandbox import list_sandbox_scenarios, run_market_sandbox
 from app.analytics.max_pain_detection import compute_max_pain
 from app.analytics.options_analysis import compute_pcr, compute_support_resistance
 from app.analytics.options_flow_detection import detect_options_flow
 from app.analytics.positioning_shift import detect_positioning_shifts
 from app.analytics.quant_signal_capture import (
     build_quant_context,
-    derive_shadow_signal,
     record_quant_signal_candidate,
-    record_shadow_decision,
 )
+from app.analytics.quick_signal_cache import get_cached_quick_signal_payload
+from app.analytics.quick_signal_observer import capture_quick_quant_observation
 from app.analytics.quick_signal import get_quick_signal
 from app.analytics.quick_signal_engine import run_quick_signal_engine
 from app.analytics.trade_manager import get_latest_trade_row, get_open_trade_row, serialize_trade_summary
@@ -42,6 +45,7 @@ from app.models.alert import Alert
 from app.models.chain_snapshot import ChainSnapshot
 from app.models.user import User
 from app.models.trading_signal import TradingSignalRow
+from app.services.market_hours import get_equity_market_status, get_mcx_market_status
 from sqlalchemy import select, desc, func
 
 logger = get_logger(__name__)
@@ -57,121 +61,64 @@ def _validate_symbol(symbol: str) -> str:
         )
     return symbol
 
-
-async def _capture_quick_quant_observation(
-    session: AsyncSession,
-    *,
-    symbol: str,
-    payload: dict[str, Any],
-) -> None:
-    now_utc = datetime.now(timezone.utc)
-    current_price = payload.get("current_price")
-    live_signal = payload.get("quick_signal") or "Wait"
-    raw_signal = payload.get("raw_signal") or live_signal
-    context_signal = raw_signal if raw_signal in ("Buy CE", "Buy PE") else live_signal
-    confidence = int(payload.get("confidence", 0) or 0)
-    state = str(payload.get("state") or "idle")
-    entry_ready = live_signal in ("Buy CE", "Buy PE")
-
-    context = await build_quant_context(
-        session,
-        symbol=symbol,
-        engine="QUICK",
-        signal=context_signal,
-        entry_time=now_utc,
-        current_price=float(current_price) if current_price is not None else None,
-        support=float(payload["support"]) if payload.get("support") is not None else None,
-        resistance=float(payload["resistance"]) if payload.get("resistance") is not None else None,
-        momentum=float(payload["momentum"]) if payload.get("momentum") is not None else None,
-        breakout=bool(payload.get("breakout")),
-        breakdown=bool(payload.get("breakdown")),
-        trap_detected=bool(payload.get("trap_detected")),
-        rangebound=bool(payload.get("rangebound")),
-        call_oi_delta=float(payload["call_oi_delta"]) if payload.get("call_oi_delta") is not None else None,
-        put_oi_delta=float(payload["put_oi_delta"]) if payload.get("put_oi_delta") is not None else None,
-        volume_spike=bool(payload.get("volume_spike")),
-        writer_support=bool(payload.get("oi_confirmed")),
-        state=state,
-        entry_ready=entry_ready,
-    )
-
-    await record_shadow_decision(
-        session,
-        engine="QUICK",
-        signal_version="quick_v2_live",
-        mode="LIVE",
-        symbol=symbol,
-        signal=live_signal,
-        confidence=confidence,
-        generated_at=now_utc,
-        reason=payload.get("reason"),
-        context=context,
-        state=state,
-        entry_ready=entry_ready,
-    )
-
-    shadow_signal, shadow_confidence, shadow_reason = derive_shadow_signal(
-        engine="QUICK",
-        signal=live_signal,
-        confidence=confidence,
-        context=context,
-        entry_ready=entry_ready,
-        raw_signal=raw_signal,
-    )
-    await record_shadow_decision(
-        session,
-        engine="QUICK",
-        signal_version="quick_v3_shadow",
-        mode="SHADOW",
-        symbol=symbol,
-        signal=shadow_signal,
-        confidence=shadow_confidence,
-        generated_at=now_utc,
-        reason=shadow_reason,
-        context=context,
-        state=state,
-        entry_ready=shadow_signal in ("Buy CE", "Buy PE"),
-    )
-
-    if current_price is not None and live_signal in ("Buy CE", "Buy PE"):
-        await record_quant_signal_candidate(
-            session,
-            engine="QUICK",
-            signal_version="quick_v2_live",
-            symbol=symbol,
-            signal=live_signal,
-            confidence=confidence,
-            entry_time=now_utc,
-            underlying_entry_price=float(current_price),
-            reason=payload.get("reason"),
-            context=context,
-            state=state,
-            entry_ready=True,
-        )
-
-    if current_price is not None and shadow_signal in ("Buy CE", "Buy PE"):
-        await record_quant_signal_candidate(
-            session,
-            engine="QUICK",
-            signal_version="quick_v3_shadow",
-            symbol=symbol,
-            signal=shadow_signal,
-            confidence=shadow_confidence,
-            entry_time=now_utc,
-            underlying_entry_price=float(current_price),
-            reason=shadow_reason,
-            context=context,
-            state=state,
-            entry_ready=True,
-        )
-
-
 @router.get("/dashboard-overview")
 async def get_dashboard_overview_route(
     session: Annotated[AsyncSession, Depends(get_db)],
     _: Annotated[User, Depends(get_current_user)],
 ) -> Any:
     return await get_dashboard_overview(session)
+
+
+@router.get("/market-status")
+async def get_market_status_route(
+    _: Annotated[User, Depends(get_current_user)],
+) -> Any:
+    now = datetime.now(timezone.utc)
+    equities = get_equity_market_status(now)
+    mcx = get_mcx_market_status(now)
+    return {
+        "generated_at": now.isoformat(),
+        "tracker_open": equities.is_open,
+        "equities": {
+            "is_open": equities.is_open,
+            "session": equities.session,
+            "is_holiday": equities.is_holiday,
+            "reason": equities.reason,
+            "next_open_ist": equities.next_open_ist,
+        },
+        "mcx": {
+            "is_open": mcx.is_open,
+            "session": mcx.session,
+            "is_holiday": mcx.is_holiday,
+            "reason": mcx.reason,
+            "next_open_ist": mcx.next_open_ist,
+        },
+    }
+
+
+@router.get("/scanners/index-breadth/{symbol}")
+async def get_index_breadth_scanner(
+    symbol: str,
+    _: Annotated[User, Depends(get_current_user)],
+) -> Any:
+    symbol = _validate_symbol(symbol)
+    snapshot = await fetch_market_breadth_snapshot(symbol)
+    return {
+        "symbol": snapshot.symbol,
+        "universe_size": snapshot.universe_size,
+        "advancers": snapshot.advancers,
+        "decliners": snapshot.decliners,
+        "unchanged": snapshot.unchanged,
+        "avg_change_pct": snapshot.avg_change_pct,
+        "breadth_score": snapshot.breadth_score,
+        "leadership_score": snapshot.leadership_score,
+        "direction_bias": snapshot.direction_bias,
+        "aligned_bullish": snapshot.aligned_bullish,
+        "aligned_bearish": snapshot.aligned_bearish,
+        "available": snapshot.available,
+        "reason": snapshot.reason,
+        "fetched_at": snapshot.fetched_at,
+    }
 
 
 # ─── Options Chain ────────────────────────────────────────────────────────────
@@ -327,6 +274,43 @@ async def get_movement(
     """Return whether there has been a meaningful move in the underlying over the last 5m/1h."""
     symbol = _validate_symbol(symbol)
     return await detect_movement(session, symbol)
+
+
+@router.get("/sandbox/scenarios")
+async def get_sandbox_scenarios(
+    _: Annotated[User, Depends(get_current_user)],
+) -> Any:
+    return {
+        "scenarios": list_sandbox_scenarios(),
+        "symbols": [
+            "NIFTY",
+            "BANKNIFTY",
+            "SENSEX",
+            "CRUDEOIL",
+            "NATGAS",
+            "GOLD",
+            "SILVER",
+        ],
+    }
+
+
+@router.get("/sandbox/run")
+async def run_sandbox_validation(
+    symbol: str = Query(default="NIFTY"),
+    scenario: str = Query(default="trend_up_news"),
+    steps: int = Query(default=120, ge=30, le=240),
+    seed: int = Query(default=7, ge=1, le=9999),
+    _: Annotated[User, Depends(get_current_user)] = None,
+) -> Any:
+    try:
+        return run_market_sandbox(
+            symbol=symbol,
+            scenario_name=scenario,
+            steps=steps,
+            seed=seed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ─── Trading signal (multi-timeframe) ────────────────────────────────────────
@@ -550,9 +534,16 @@ async def get_quick_signal_engine_route(
     Independent of all other signal engines and APIs.
     """
     symbol = _validate_symbol(symbol)
+    cached = await get_cached_quick_signal_payload(
+        symbol,
+        max_age_seconds=max(8, settings.quick_signal_poll_seconds),
+    )
+    if cached is not None:
+        return cached
+
     payload = await run_quick_signal_engine(session, symbol)
     try:
-        await _capture_quick_quant_observation(session, symbol=symbol, payload=payload)
+        await capture_quick_quant_observation(session, symbol=symbol, payload=payload)
     except Exception as exc:
         logger.debug("quick_quant_capture_failed", symbol=symbol, error=str(exc))
     return payload
@@ -657,7 +648,7 @@ async def create_buy_signal(
             await record_quant_signal_candidate(
                 session,
                 engine=(body.engine or "QUICK"),
-                signal_version="quick_v2_live" if (body.engine or "QUICK").upper() == "QUICK" else "main_v2_live",
+                signal_version="quick_v4_live" if (body.engine or "QUICK").upper() == "QUICK" else "main_v4_live",
                 symbol=symbol,
                 signal=body.signal,
                 confidence=int(body.confidence or 0),
@@ -681,6 +672,7 @@ async def list_buy_signals(
     current_user: Annotated[User, Depends(get_current_user)],
     symbol: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
+    today_only: bool = Query(default=True, description="Return only today's IST signals"),
 ) -> Any:
     """List recent buy signals for the current user (for Quick Signals buy history)."""
     from app.models.buy_signal_history import BuySignalHistory
@@ -693,21 +685,39 @@ async def list_buy_signals(
     )
     if symbol:
         stmt = stmt.where(BuySignalHistory.symbol == _validate_symbol(symbol))
+    if today_only:
+        stmt = stmt.where(
+            func.date(func.timezone("Asia/Calcutta", BuySignalHistory.created_at))
+            == func.date(func.timezone("Asia/Calcutta", func.now()))
+        )
     rows = (await session.execute(stmt)).scalars().all()
+
+    def _to_ist(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone(timedelta(hours=5, minutes=30)))
+
+    def _serialize_history_row(r: Any) -> dict[str, Any]:
+        created_ist = _to_ist(r.created_at)
+        return {
+            "id": r.id,
+            "symbol": r.symbol,
+            "signal": r.signal,
+            "level": float(r.level) if r.level else None,
+            "momentum": float(r.momentum) if r.momentum else None,
+            "reason": r.reason,
+            "time": created_ist.strftime("%H:%M:%S") if created_ist else None,
+            "date": created_ist.strftime("%Y-%m-%d") if created_ist else None,
+            "datetime_ist": created_ist.strftime("%Y-%m-%d %H:%M:%S IST") if created_ist else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+
     return {
-        "history": [
-            {
-                "id": r.id,
-                "symbol": r.symbol,
-                "signal": r.signal,
-                "level": float(r.level) if r.level else None,
-                "momentum": float(r.momentum) if r.momentum else None,
-                "reason": r.reason,
-                "time": r.created_at.strftime("%H:%M:%S") if r.created_at else None,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in rows
-        ],
+        "history": [_serialize_history_row(r) for r in rows],
+        "today_only": today_only,
     }
 
 
@@ -742,6 +752,31 @@ async def get_alerts(
         ],
         "count": len(rows),
     }
+
+
+@router.get("/global-news-alerts")
+async def get_global_news_alerts_route(
+    session: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[User, Depends(get_current_user)],
+    symbols: str | None = Query(default=None, description="Optional comma-separated symbols filter"),
+    limit: int = Query(default=10, ge=1, le=25),
+) -> Any:
+    requested_symbols = [item.strip().upper() for item in (symbols or "").split(",") if item.strip()]
+    if requested_symbols:
+        alerts = await list_recent_global_news_alerts(session, symbols=requested_symbols, limit=limit)
+        return {
+            "alerts": alerts,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cached": True,
+            "count": len(alerts),
+        }
+
+    return await get_global_news_alerts_payload(
+        session,
+        limit=limit,
+        allow_stale=True,
+        refresh_if_missing=True,
+    )
 
 
 # ─── AI Market Summary ────────────────────────────────────────────────────────

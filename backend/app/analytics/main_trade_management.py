@@ -69,6 +69,16 @@ def derive_main_trade_management_plan(
                 hard_exit=True,
                 hard_exit_reason="Higher-timeframe finish bias has flipped bearish.",
             )
+        if (
+            long_context is not None
+            and long_context.breadth_available
+            and int(long_context.breadth_score or 0) <= -25
+            and confidence < 72
+        ):
+            return MainTradeManagementPlan(
+                hard_exit=True,
+                hard_exit_reason="Internal breadth has flipped against the bullish trade.",
+            )
         structural_break = (
             (vwap is not None and _price_below(vwap, price))
             and (
@@ -85,10 +95,25 @@ def derive_main_trade_management_plan(
             )
 
         if (
+            current_points is not None
+            and current_points >= open_trade.success_threshold_points * 0.5
+            and outlook != Bias.BULLISH
+            and (
+                (vwap is not None and _price_below(vwap, price))
+                or _price_below(opening_low, price)
+                or _price_below(prev_close, price)
+            )
+        ):
+            return MainTradeManagementPlan(
+                hard_exit=True,
+                hard_exit_reason="Bullish finish bias is fading after partial gains. Locking the trade.",
+            )
+
+        if (
             open_trade.max_favorable_points >= open_trade.success_threshold_points
             and current_points is not None
-            and current_points < open_trade.max_favorable_points * 0.5
-            and confidence < 70
+            and current_points < open_trade.max_favorable_points * 0.65
+            and confidence < 72
         ):
             return MainTradeManagementPlan(
                 hard_exit=True,
@@ -121,6 +146,16 @@ def derive_main_trade_management_plan(
             hard_exit=True,
             hard_exit_reason="Higher-timeframe finish bias has flipped bullish.",
         )
+    if (
+        long_context is not None
+        and long_context.breadth_available
+        and int(long_context.breadth_score or 0) >= 25
+        and confidence < 72
+    ):
+        return MainTradeManagementPlan(
+            hard_exit=True,
+            hard_exit_reason="Internal breadth has flipped against the bearish trade.",
+        )
 
     structural_break = (
         (vwap is not None and _price_above(vwap, price))
@@ -138,10 +173,25 @@ def derive_main_trade_management_plan(
         )
 
     if (
+        current_points is not None
+        and current_points >= open_trade.success_threshold_points * 0.5
+        and outlook != Bias.BEARISH
+        and (
+            (vwap is not None and _price_above(vwap, price))
+            or _price_above(opening_high, price)
+            or _price_above(prev_close, price)
+        )
+    ):
+        return MainTradeManagementPlan(
+            hard_exit=True,
+            hard_exit_reason="Bearish finish bias is fading after partial gains. Locking the trade.",
+        )
+
+    if (
         open_trade.max_favorable_points >= open_trade.success_threshold_points
         and current_points is not None
-        and current_points < open_trade.max_favorable_points * 0.5
-        and confidence < 70
+        and current_points < open_trade.max_favorable_points * 0.65
+        and confidence < 72
     ):
         return MainTradeManagementPlan(
             hard_exit=True,

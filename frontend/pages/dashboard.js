@@ -3,7 +3,7 @@ import clsx from "clsx";
 
 import Layout from "../components/Layout";
 import { analyticsApi } from "../lib/api";
-import { isMarketOpen } from "../components/MarketTicker";
+import { defaultMarketStatus, isMarketOpen } from "../components/MarketTicker";
 import MarketBiasPanel from "../components/MarketBiasPanel";
 import TradeSignalsPanel from "../components/TradeSignalsPanel";
 import AIInsightsPanel from "../components/AIInsightsPanel";
@@ -14,6 +14,7 @@ import OptionsDashboard from "../components/OptionsDashboard";
 import GammaWallChart from "../components/GammaWallChart";
 import OptionsFlowPanel from "../components/OptionsFlowPanel";
 import AlertsPanel from "../components/AlertsPanel";
+import GlobalAlertsPanel from "../components/GlobalAlertsPanel";
 
 const SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"];
 const TABS = [
@@ -48,12 +49,23 @@ function SectionLabel({ number, title }) {
 export default function Dashboard() {
   const [tab, setTab] = useState("signals");
   const [symbol, setSymbol] = useState("NIFTY");
+  const [alertSymbol, setAlertSymbol] = useState("NIFTY");
   const [lastDataUpdate, setLastDataUpdate] = useState(null);
   const [tickerLastUpdate, setTickerLastUpdate] = useState(null);
   const [, setRelativeTick] = useState(0);
   const [refreshTick, setRefreshTick] = useState(0);
   const [movementTick, setMovementTick] = useState(0);
-  const [marketOpen, setMarketOpen] = useState(isMarketOpen());
+  const [marketStatus, setMarketStatus] = useState(defaultMarketStatus());
+  const [marketOpen, setMarketOpen] = useState(false);
+
+  const syncMarketStatus = useCallback(() => {
+    return analyticsApi.marketStatus().then((status) => {
+      setMarketStatus(status);
+      const open = isMarketOpen(status);
+      setMarketOpen(open);
+      return open;
+    });
+  }, []);
 
   const onDataLoaded = useCallback(() => {
     analyticsApi.lastRefresh().then((data) => {
@@ -63,16 +75,16 @@ export default function Dashboard() {
 
   useEffect(() => {
     const id = setInterval(() => {
-      const open = isMarketOpen();
-      setMarketOpen(open);
-      if (open) setRefreshTick((tick) => tick + 1);
+      syncMarketStatus().then((open) => {
+        if (open) setRefreshTick((tick) => tick + 1);
+      });
     }, 30_000);
     return () => clearInterval(id);
-  }, []);
+  }, [syncMarketStatus]);
 
   useEffect(() => {
     const checkMovement = () => {
-      if (!isMarketOpen()) return;
+      if (!marketOpen) return;
       Promise.all(
         SYMBOLS.map((item) =>
           analyticsApi.movement(item).catch(() => ({ movement_significant: false }))
@@ -87,22 +99,23 @@ export default function Dashboard() {
     checkMovement();
     const id = setInterval(checkMovement, 60_000);
     return () => clearInterval(id);
-  }, []);
+  }, [marketOpen]);
 
   useEffect(() => {
+    syncMarketStatus();
     analyticsApi.lastRefresh().then((data) => {
       if (data?.last_refresh_utc) setLastDataUpdate(new Date(data.last_refresh_utc));
     });
 
     const id = setInterval(() => {
-      if (!isMarketOpen()) return;
+      if (!marketOpen) return;
       analyticsApi.lastRefresh().then((data) => {
         if (data?.last_refresh_utc) setLastDataUpdate(new Date(data.last_refresh_utc));
       });
     }, 30_000);
 
     return () => clearInterval(id);
-  }, []);
+  }, [marketOpen, syncMarketStatus]);
 
   const displayUpdate = marketOpen && tickerLastUpdate ? tickerLastUpdate : lastDataUpdate;
 
@@ -167,7 +180,7 @@ export default function Dashboard() {
                 ) : marketOpen ? (
                   "Fetching..."
                 ) : (
-                  "Market closed"
+                  marketStatus?.equities?.reason || "Market closed"
                 )}
               </span>
             </div>
@@ -208,6 +221,31 @@ export default function Dashboard() {
           <div className="space-y-3">
             <SectionLabel number="3" title="AI Market Insights" />
             <AIInsightsPanel onDataLoaded={onDataLoaded} refreshTick={movementTick} />
+          </div>
+          <div className="space-y-3">
+            <SectionLabel number="4" title="Market Alerts" />
+            <div className="space-y-4">
+              <div className="flex flex-wrap gap-2 rounded-2xl border border-surface-border bg-white/5 p-1.5">
+                {SYMBOLS.map((item) => (
+                  <button
+                    key={item}
+                    onClick={() => setAlertSymbol(item)}
+                    className={clsx(
+                      "rounded-xl px-4 py-2 text-sm font-medium transition-all",
+                      alertSymbol === item
+                        ? "bg-brand-600 text-white shadow-lg shadow-brand-500/20"
+                        : "text-slate-400 hover:bg-white/5 hover:text-slate-100"
+                    )}
+                  >
+                    {item}
+                  </button>
+                ))}
+              </div>
+              <div className="grid gap-4 xl:grid-cols-[0.95fr_1.05fr]">
+                <AlertsPanel symbol={alertSymbol} limit={20} />
+                <GlobalAlertsPanel compact />
+              </div>
+            </div>
           </div>
           <TimeFactorCard symbol="NIFTY" refreshTick={refreshTick} onDataLoaded={onDataLoaded} />
         </div>

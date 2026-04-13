@@ -106,6 +106,8 @@ async def get_mcx_prices() -> dict[str, Any]:
         close = ohlc.get("close")  # previous close provided by Kite
         price = float(last) if last is not None else None
         base = float(close) if close is not None else None
+        volume = q.get("volume")
+        oi = q.get("oi")
         change = round(price - base, 2) if (price is not None and base) else None
         change_pct = round(change / base * 100, 2) if (change is not None and base) else None
         out[name] = {
@@ -113,6 +115,8 @@ async def get_mcx_prices() -> dict[str, Any]:
             "price": price,
             "change": change,
             "change_pct": change_pct,
+            "volume": float(volume) if volume is not None else None,
+            "oi": float(oi) if oi is not None else None,
         }
     return out
 

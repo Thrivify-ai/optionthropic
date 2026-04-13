@@ -2,9 +2,15 @@ import unittest
 from datetime import date, datetime, timezone
 
 from app.services.market_hours import (
+    get_equity_market_status,
+    get_mcx_market_status,
+    global_news_poll_interval_seconds,
     ai_cache_ttl_seconds,
     dashboard_cache_ttl_seconds,
+    global_news_cache_ttl_seconds,
     is_indian_market_open,
+    is_market_news_window_open,
+    is_mcx_market_open,
     latest_completed_trading_day,
     needs_completed_day_refresh,
     previous_trading_day,
@@ -25,6 +31,36 @@ class MarketHoursTests(unittest.TestCase):
     def test_market_is_closed_on_weekends(self) -> None:
         saturday = datetime(2026, 3, 21, 5, 0, tzinfo=timezone.utc)  # 10:30 IST
         self.assertFalse(is_indian_market_open(saturday))
+
+    def test_equity_holiday_closes_market_on_weekday(self) -> None:
+        ram_navami = datetime(2026, 3, 26, 5, 30, tzinfo=timezone.utc)  # 11:00 IST
+        status = get_equity_market_status(ram_navami)
+        self.assertFalse(is_indian_market_open(ram_navami))
+        self.assertFalse(should_refresh_intraday_caches(ram_navami))
+        self.assertTrue(status.is_holiday)
+        self.assertIn("Ram Navami", status.reason)
+
+    def test_mcx_evening_session_can_open_on_equity_holiday(self) -> None:
+        ram_navami_evening = datetime(2026, 3, 26, 12, 0, tzinfo=timezone.utc)  # 17:30 IST
+        status = get_mcx_market_status(ram_navami_evening)
+        self.assertTrue(is_mcx_market_open(ram_navami_evening))
+        self.assertTrue(status.is_open)
+        self.assertEqual(status.session, "EVENING")
+
+    def test_global_news_refreshes_fast_during_mcx_evening_session(self) -> None:
+        ram_navami_evening = datetime(2026, 3, 26, 12, 0, tzinfo=timezone.utc)  # 17:30 IST
+        sunday_closed = datetime(2026, 3, 22, 12, 0, tzinfo=timezone.utc)
+
+        self.assertTrue(is_market_news_window_open(ram_navami_evening))
+        self.assertFalse(is_indian_market_open(ram_navami_evening))
+        self.assertLess(
+            global_news_poll_interval_seconds(ram_navami_evening),
+            global_news_poll_interval_seconds(sunday_closed),
+        )
+        self.assertLess(
+            global_news_cache_ttl_seconds(ram_navami_evening),
+            global_news_cache_ttl_seconds(sunday_closed),
+        )
 
     def test_cache_ttls_change_by_market_state(self) -> None:
         monday_open = datetime(2026, 3, 23, 4, 30, tzinfo=timezone.utc)

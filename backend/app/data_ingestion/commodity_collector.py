@@ -14,6 +14,7 @@ from app.analytics.mcx_prices import get_mcx_prices
 from app.db.database import AsyncSessionLocal
 from app.logging_config import get_logger
 from app.models.commodity_snapshot import CommoditySnapshot
+from app.services.market_hours import get_mcx_market_status
 
 logger = get_logger(__name__)
 
@@ -26,30 +27,39 @@ async def run_commodity_collector() -> None:
     logger.info("Commodity collector started", interval=POLL_SECONDS, symbols=list(SYMBOLS))
     while True:
         try:
-            data = await get_mcx_prices()
-            if data.get("error"):
-                logger.warning("Commodity collector: mcx-prices error", error=data["error"])
+            status = get_mcx_market_status()
+            if not status.is_open:
+                logger.info(
+                    "Commodity collector skipped",
+                    reason=status.reason,
+                    session=status.session,
+                    next_open_ist=status.next_open_ist,
+                )
             else:
-                ts = datetime.now(timezone.utc)
-                async with AsyncSessionLocal() as session:
-                    for sym in SYMBOLS:
-                        row = data.get(sym) or {}
-                        price = row.get("price")
-                        if price is None:
-                            continue
-                        # Kite quote may include volume/oi in some accounts; default to 0.
-                        vol = float(row.get("volume") or 0)
-                        oi = float(row.get("oi") or 0)
-                        session.add(
-                            CommoditySnapshot(
-                                symbol=sym,
-                                price=float(price),
-                                volume=vol,
-                                oi=oi,
-                                timestamp=ts,
+                data = await get_mcx_prices()
+                if data.get("error"):
+                    logger.warning("Commodity collector: mcx-prices error", error=data["error"])
+                else:
+                    ts = datetime.now(timezone.utc)
+                    async with AsyncSessionLocal() as session:
+                        for sym in SYMBOLS:
+                            row = data.get(sym) or {}
+                            price = row.get("price")
+                            if price is None:
+                                continue
+                            # Kite quote may include volume/oi in some accounts; default to 0.
+                            vol = float(row.get("volume") or 0)
+                            oi = float(row.get("oi") or 0)
+                            session.add(
+                                CommoditySnapshot(
+                                    symbol=sym,
+                                    price=float(price),
+                                    volume=vol,
+                                    oi=oi,
+                                    timestamp=ts,
+                                )
                             )
-                        )
-                    await session.commit()
+                        await session.commit()
         except Exception as exc:
             logger.warning("Commodity collector cycle failed", error=str(exc))
 

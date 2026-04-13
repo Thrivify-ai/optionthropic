@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     poll_interval_seconds: int = 45
     fast_tick_poll_seconds: int = 5
+    quick_signal_poll_seconds: int = 15
 
     # Database
     database_url: str = "postgresql+asyncpg://optionthropic:optionthropic_secret@localhost:5432/optionthropic"
@@ -55,6 +56,8 @@ class Settings(BaseSettings):
         "https://news.google.com/rss/search?q=(Federal%20Reserve%20OR%20FOMC%20OR%20inflation%20OR%20CPI%20OR%20payrolls%20OR%20bond%20yields%20OR%20rate%20cut%20OR%20rate%20hike)&hl=en-IN&gl=IN&ceid=IN:en",
         "https://news.google.com/rss/search?q=(oil%20OR%20crude%20OR%20OPEC%20OR%20Middle%20East%20OR%20sanctions%20OR%20tariff%20OR%20war)&hl=en-IN&gl=IN&ceid=IN:en",
         "https://news.google.com/rss/search?q=(RBI%20OR%20rupee%20OR%20USDINR%20OR%20China%20stimulus%20OR%20Asia%20markets%20OR%20India%20markets)&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=(gold%20OR%20silver%20OR%20bullion%20OR%20DXY%20OR%20dollar%20OR%20treasury%20yield%20OR%20safe%20haven)&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=(natural%20gas%20OR%20LNG%20OR%20Freeport%20OR%20pipeline%20outage%20OR%20gas%20storage%20OR%20EIA%20inventory)&hl=en-IN&gl=IN&ceid=IN:en",
     ]
 
     # Shared cache

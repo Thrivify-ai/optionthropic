@@ -13,12 +13,14 @@ from fastapi.responses import JSONResponse
 
 from app.api.admin_routes import router as admin_router
 from app.api.auth_routes import router as auth_router
+from app.api.publishing_routes import router as publishing_router
 from app.api.pro_routes import router as pro_router
 from app.api.routes import router as api_router
 from app.config import settings
 from app.data_ingestion.commodity_collector import run_commodity_collector
 from app.data_ingestion.global_news_collector import run_global_news_collector
 from app.data_ingestion.options_collector import run_collector
+from app.data_ingestion.quick_signal_collector import run_quick_signal_collector
 from app.db.database import create_all_tables
 from app.logging_config import configure_logging, get_logger
 from app.services.cache_warmers import warm_startup_caches
@@ -79,6 +81,8 @@ async def lifespan(app: FastAPI):
 
     collector_task = asyncio.create_task(run_collector())
     logger.info("Options collector started")
+    quick_signal_task = asyncio.create_task(run_quick_signal_collector())
+    logger.info("Quick signal collector started")
     commodity_task = asyncio.create_task(run_commodity_collector())
     logger.info("Commodity collector started")
     global_news_task = asyncio.create_task(run_global_news_collector())
@@ -87,10 +91,15 @@ async def lifespan(app: FastAPI):
     yield
 
     collector_task.cancel()
+    quick_signal_task.cancel()
     commodity_task.cancel()
     global_news_task.cancel()
     try:
         await collector_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await quick_signal_task
     except asyncio.CancelledError:
         pass
     try:
@@ -145,6 +154,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router)
     app.include_router(api_router)
+    app.include_router(publishing_router)
     app.include_router(pro_router)
     app.include_router(admin_router)
 

@@ -3,8 +3,8 @@
  *
  * Behaviour:
  * - Always fetches on mount so last-known prices are visible even when closed.
- * - Checks market-open status every 15 s so "Live" / "Closed" flips quickly at
- *   09:00 IST open or 15:30 IST close.
+ * - Checks backend market status every 15 s so holidays and split MCX sessions
+ *   are handled correctly instead of relying on a raw weekday clock.
  * - Price data refreshes every 60 s while market is open; pauses when closed.
  * - On the transition from closed → open the first live fetch fires immediately.
  */
@@ -15,10 +15,43 @@ import clsx from "clsx";
 const SYMBOLS       = ["NIFTY", "BANKNIFTY", "SENSEX"];
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
-export function isMarketOpen() {
-  const now  = new Date(Date.now() + IST_OFFSET_MS);
-  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
-  return mins >= 9 * 60 && mins <= 15 * 60 + 30;
+export function defaultMarketStatus() {
+  return {
+    tracker_open: false,
+    equities: {
+      is_open: false,
+      session: "CLOSED",
+      is_holiday: false,
+      reason: "Loading market calendar...",
+      next_open_ist: null,
+    },
+    mcx: {
+      is_open: false,
+      session: "CLOSED",
+      is_holiday: false,
+      reason: "Loading market calendar...",
+      next_open_ist: null,
+    },
+  };
+}
+
+export function isMarketOpen(status = null) {
+  return Boolean(status?.tracker_open);
+}
+
+function statusLabel(status) {
+  const equities = status?.equities || {};
+  const mcx = status?.mcx || {};
+  if (status?.tracker_open) return "Equities Open";
+  if (equities.is_holiday && mcx.next_open_ist) {
+    return `Equities Holiday · MCX ${mcx.is_open ? "Open" : `opens ${mcx.next_open_ist.split(" ")[1]} IST`}`;
+  }
+  if (equities.is_holiday) return "Equities Holiday";
+  if (mcx.is_open) return "Equities Closed · MCX Open";
+  if (mcx.next_open_ist && mcx.session === "INTERMISSION") {
+    return `Equities Closed · MCX opens ${mcx.next_open_ist.split(" ")[1]} IST`;
+  }
+  return "Market Closed";
 }
 
 function fmt(val) {
@@ -88,8 +121,9 @@ function PriceItem({ symbol, data, live }) {
 export default function MarketTicker({ refreshTick, onTickerUpdate }) {
   const [prices, setPrices] = useState({});
   const [liveMode, setLiveMode] = useState(false);  // true when tick-by-tick data flows
-  const [open, setOpen]     = useState(isMarketOpen());
-  const wasOpenRef          = useRef(isMarketOpen());
+  const [marketStatus, setMarketStatus] = useState(defaultMarketStatus());
+  const [open, setOpen]     = useState(false);
+  const wasOpenRef          = useRef(false);
   const priceTimerRef       = useRef(null);
 
   const loadPrices = () => {
@@ -138,6 +172,16 @@ export default function MarketTicker({ refreshTick, onTickerUpdate }) {
     priceTimerRef.current = setInterval(pollPrices, 5_000);
   };
 
+  const loadStatus = () =>
+    analyticsApi.marketStatus()
+      .then((status) => {
+        const trackerOpen = isMarketOpen(status);
+        setMarketStatus(status);
+        setOpen(trackerOpen);
+        return trackerOpen;
+      })
+      .catch(() => false);
+
   const stopPricePolling = () => {
     if (priceTimerRef.current) {
       clearInterval(priceTimerRef.current);
@@ -149,19 +193,21 @@ export default function MarketTicker({ refreshTick, onTickerUpdate }) {
 
   useEffect(() => {
     loadPrices();
-    if (isMarketOpen()) startPricePolling();
+    loadStatus().then((trackerOpen) => {
+      if (trackerOpen) startPricePolling();
+    });
 
     const statusTimer = setInterval(() => {
-      const mo = isMarketOpen();
-      setOpen(mo);
-      if (mo && !wasOpenRef.current) {
-        pollPrices();
-        startPricePolling();
-      } else if (!mo && wasOpenRef.current) {
-        stopPricePolling();
-        loadPrices();
-      }
-      wasOpenRef.current = mo;
+      loadStatus().then((mo) => {
+        if (mo && !wasOpenRef.current) {
+          pollPrices();
+          startPricePolling();
+        } else if (!mo && wasOpenRef.current) {
+          stopPricePolling();
+          loadPrices();
+        }
+        wasOpenRef.current = mo;
+      });
     }, 15_000);
 
     return () => {
@@ -171,7 +217,7 @@ export default function MarketTicker({ refreshTick, onTickerUpdate }) {
   }, []);
 
   useEffect(() => {
-    if (refreshTick > 0 && isMarketOpen()) pollPrices();
+    if (refreshTick > 0 && open) pollPrices();
   }, [refreshTick]);
 
   return (
@@ -187,7 +233,7 @@ export default function MarketTicker({ refreshTick, onTickerUpdate }) {
             )}
           />
           <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-500 whitespace-nowrap">
-            {open ? "Market Open" : "Market Closed"}
+            {statusLabel(marketStatus)}
           </span>
         </div>
 

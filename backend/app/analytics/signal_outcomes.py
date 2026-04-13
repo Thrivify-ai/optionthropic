@@ -30,6 +30,17 @@ _CONFIDENCE_BUCKETS = (
     (90, 100, "90-100"),
 )
 
+_PROTECTIVE_EXIT_KEYWORDS = (
+    "opposite",
+    "stop",
+    "invalidated",
+    "invalidation",
+    "trap",
+    "protected",
+    "trailing",
+    "giveback",
+)
+
 
 @dataclass
 class CalibrationRow:
@@ -287,7 +298,77 @@ def serialize_outcome_row(row: SignalOutcome) -> dict[str, Any]:
     }
 
 
+def _aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _duration_label(seconds: int | None) -> str | None:
+    if seconds is None:
+        return None
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remaining_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {remaining_seconds}s" if remaining_seconds else f"{minutes}m"
+    hours, remaining_minutes = divmod(minutes, 60)
+    return f"{hours}h {remaining_minutes}m" if remaining_minutes else f"{hours}h"
+
+
+def managed_trade_duration_seconds(row: Any, *, now_utc: datetime | None = None) -> int | None:
+    entry_time = _aware_utc(getattr(row, "entry_time", None))
+    if entry_time is None:
+        return None
+    exit_time = _aware_utc(getattr(row, "exit_time", None))
+    end_time = exit_time or _aware_utc(now_utc) or datetime.now(timezone.utc)
+    return max(0, int((end_time - entry_time).total_seconds()))
+
+
+def classify_managed_exit_type(row: Any) -> str:
+    status = str(getattr(row, "status", "") or "").upper()
+    if status == "OPEN":
+        return "Open"
+
+    reason = str(getattr(row, "exit_reason", "") or "").lower()
+    signal = str(getattr(row, "exit_signal", "") or "").lower()
+    points = getattr(row, "realized_points", None)
+    realized = float(points) if points is not None else None
+
+    if "stop" in reason:
+        return "Stop"
+    if "opposite" in reason:
+        return "Opposite Move"
+    if "trailing" in reason or "giveback" in reason:
+        return "Trailing Protect"
+    if "protected" in reason:
+        return "Profit Protect"
+    if "invalid" in reason or "trap" in reason:
+        return "Trap / Invalidated"
+    if "exit" in signal and realized is not None and realized > 0:
+        return "Booked Profit"
+    if realized is not None and realized < 0:
+        return "Loss Exit"
+    return "Closed"
+
+
+def is_protective_exit(row: Any) -> bool:
+    text = " ".join(
+        str(getattr(row, field, "") or "").lower()
+        for field in ("exit_reason", "latest_reason", "exit_signal")
+    )
+    return any(keyword in text for keyword in _PROTECTIVE_EXIT_KEYWORDS)
+
+
 def serialize_managed_trade_row(row: Any) -> dict[str, Any]:
+    duration_seconds = managed_trade_duration_seconds(row)
+    captured_points = row.realized_points if row.realized_points is not None else row.latest_points
+    giveback_points = None
+    if row.max_favorable_points is not None and row.realized_points is not None:
+        giveback_points = max(0.0, float(row.max_favorable_points) - float(row.realized_points))
+
     return {
         "id": row.id,
         "engine": row.engine,
@@ -309,12 +390,90 @@ def serialize_managed_trade_row(row: Any) -> dict[str, Any]:
         "exit_signal": row.exit_signal,
         "exit_price": round(float(row.exit_price), 2) if row.exit_price is not None else None,
         "realized_points": round(float(row.realized_points), 2) if row.realized_points is not None else None,
+        "captured_points": round(float(captured_points), 2) if captured_points is not None else None,
+        "giveback_points": round(float(giveback_points), 2) if giveback_points is not None else None,
         "result_label": row.result_label,
         "entry_time": row.entry_time.isoformat() if row.entry_time else None,
         "exit_time": row.exit_time.isoformat() if row.exit_time else None,
+        "trade_duration_seconds": duration_seconds,
+        "trade_duration_label": _duration_label(duration_seconds),
+        "exit_type": classify_managed_exit_type(row),
+        "protective_exit": is_protective_exit(row),
         "entry_reason": row.entry_reason,
         "exit_reason": row.exit_reason,
     }
+
+
+def summarize_managed_trades(rows: list[Any]) -> dict[str, Any]:
+    won = sum(1 for row in rows if row.result_label == "Won")
+    lost = sum(1 for row in rows if row.result_label == "Lost")
+    scratch = sum(1 for row in rows if row.result_label == "Scratch")
+    open_count = sum(1 for row in rows if row.status == "OPEN")
+    closed_count = sum(1 for row in rows if row.status == "CLOSED")
+    protective_exits = sum(1 for row in rows if row.status == "CLOSED" and is_protective_exit(row))
+    decided = won + lost + scratch
+    closed_durations = [
+        managed_trade_duration_seconds(row)
+        for row in rows
+        if row.status == "CLOSED" and managed_trade_duration_seconds(row) is not None
+    ]
+    avg_points = (
+        round(
+            sum(float(row.realized_points or 0) for row in rows if row.realized_points is not None)
+            / max(1, sum(1 for row in rows if row.realized_points is not None)),
+            1,
+        )
+        if any(row.realized_points is not None for row in rows)
+        else None
+    )
+    avg_duration_seconds = (
+        round(sum(int(value) for value in closed_durations) / len(closed_durations), 1)
+        if closed_durations
+        else None
+    )
+    net_points = round(
+        sum(float(row.realized_points or 0) for row in rows if row.realized_points is not None),
+        2,
+    )
+    return {
+        "total": len(rows),
+        "entries": len(rows),
+        "closed": closed_count,
+        "won": won,
+        "lost": lost,
+        "scratch": scratch,
+        "open": open_count,
+        "protective_exits": protective_exits,
+        "win_rate_pct": round(100 * won / decided, 1) if decided > 0 else None,
+        "avg_realized_points": avg_points,
+        "net_points": net_points,
+        "avg_duration_seconds": avg_duration_seconds,
+        "avg_duration_label": _duration_label(int(avg_duration_seconds)) if avg_duration_seconds is not None else None,
+    }
+
+
+def managed_summary_by_engine(rows: list[Any]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.engine).upper(), []).append(row)
+    return {
+        engine: summarize_managed_trades(engine_rows)
+        for engine, engine_rows in sorted(grouped.items())
+    }
+
+
+def _point_bucket(points: float | None) -> str:
+    if points is None:
+        return "Unknown"
+    if points < 0:
+        return "Loss"
+    if points < 5:
+        return "Scratch"
+    if points < 15:
+        return "Scalp Win"
+    if points < 30:
+        return "Good Win"
+    return "Strong Win"
 
 
 async def build_signal_analytics_payload(
@@ -376,34 +535,20 @@ async def build_signal_analytics_payload(
     quick_decided = quick_won + quick_lost
     long_decided = long_won + long_lost
 
-    def _managed_summary(rows: list[Any]) -> dict[str, Any]:
-        won = sum(1 for row in rows if row.result_label == "Won")
-        lost = sum(1 for row in rows if row.result_label == "Lost")
-        scratch = sum(1 for row in rows if row.result_label == "Scratch")
-        open_count = sum(1 for row in rows if row.status == "OPEN")
-        decided = won + lost + scratch
-        avg_points = (
-            round(
-                sum(float(row.realized_points or 0) for row in rows if row.realized_points is not None)
-                / max(1, sum(1 for row in rows if row.realized_points is not None)),
-                1,
-            )
-            if any(row.realized_points is not None for row in rows)
-            else None
-        )
-        return {
-            "total": len(rows),
-            "won": won,
-            "lost": lost,
-            "scratch": scratch,
-            "open": open_count,
-            "win_rate_pct": round(100 * won / decided, 1) if decided > 0 else None,
-            "avg_realized_points": avg_points,
-        }
+    def _managed_point_distribution(rows: list[Any]) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        for row in rows:
+            bucket = _point_bucket(float(row.realized_points)) if row.realized_points is not None else "Open"
+            counts[bucket] = counts.get(bucket, 0) + 1
+        return [
+            {"bucket": bucket, "count": count}
+            for bucket, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
 
     return {
         "quick_signals": quick_signals,
         "long_signals": long_signals,
+        "scorecard_source": "managed_trades",
         "quick_summary": {
             "total": len(quick_rows),
             "won": quick_won,
@@ -420,8 +565,12 @@ async def build_signal_analytics_payload(
         },
         "managed_quick_trades": [serialize_managed_trade_row(row) for row in managed_quick_rows],
         "managed_long_trades": [serialize_managed_trade_row(row) for row in managed_main_rows],
-        "managed_quick_summary": _managed_summary(managed_quick_rows),
-        "managed_long_summary": _managed_summary(managed_main_rows),
+        "managed_trades": [serialize_managed_trade_row(row) for row in managed_rows],
+        "managed_summary_by_engine": managed_summary_by_engine(managed_rows),
+        "managed_quick_summary": summarize_managed_trades(managed_quick_rows),
+        "managed_long_summary": summarize_managed_trades(managed_main_rows),
+        "managed_quick_point_distribution": _managed_point_distribution(managed_quick_rows),
+        "managed_long_point_distribution": _managed_point_distribution(managed_main_rows),
         "quick_calibration": summarize_calibration(quick_states),
         "long_calibration": summarize_calibration(long_states),
         "days": days,

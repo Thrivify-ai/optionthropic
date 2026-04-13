@@ -44,6 +44,12 @@ export const analyticsApi = {
       .catch(() => ({ symbols: {} }));
     return dashboardOverviewCache.promise;
   },
+  marketStatus: () =>
+    api.get("/api/market-status").then((r) => r.data).catch(() => ({
+      tracker_open: false,
+      equities: { is_open: false, session: "CLOSED", is_holiday: false, reason: "Unavailable", next_open_ist: null },
+      mcx: { is_open: false, session: "CLOSED", is_holiday: false, reason: "Unavailable", next_open_ist: null },
+    })),
   optionsChain: (symbol) =>
     api.get(`/api/options-chain/${symbol}`).then((r) => r.data),
   supportResistance: (symbol) =>
@@ -69,11 +75,28 @@ export const analyticsApi = {
   saveBuySignal: (body) =>
     api.post("/api/buy-signal-history", body).then((r) => r.data).catch(() => null),
   /** Fetch buy signal history for Quick Signals. */
-  buySignalHistory: (symbol) =>
-    api.get("/api/buy-signal-history", { params: symbol ? { symbol } : {} }).then((r) => r.data?.history ?? []).catch(() => []),
+  buySignalHistory: (symbol, { todayOnly = true, limit = 50 } = {}) =>
+    api
+      .get("/api/buy-signal-history", {
+        params: {
+          ...(symbol ? { symbol } : {}),
+          today_only: todayOnly,
+          limit,
+        },
+      })
+      .then((r) => r.data?.history ?? [])
+      .catch(() => []),
   /** Global market-moving news alerts. Returns critical feed items only. */
-  globalNewsAlerts: () =>
-    api.get("/api/pro/global-alerts").then((r) => r.data).catch(() => ({ alerts: [], generated_at: null, cached: false })),
+  globalNewsAlerts: (symbols = null, limit = 10) =>
+    api
+      .get("/api/global-news-alerts", {
+        params: {
+          ...(symbols ? { symbols: Array.isArray(symbols) ? symbols.join(",") : symbols } : {}),
+          limit,
+        },
+      })
+      .then((r) => r.data)
+      .catch(() => ({ alerts: [], generated_at: null, cached: false })),
   /** No auth required. Returns { token_set, token_valid, bfo_sensex_instruments, message }. */
   zerodhaStatus: () =>
     api.get("/api/zerodha-status").then((r) => r.data).catch(() => ({ token_set: false, token_valid: false, message: "Could not reach backend" })),
@@ -86,6 +109,8 @@ export const analyticsApi = {
   /** Movement detector: has the underlying moved meaningfully in last 5m/1h. */
   movement: (symbol) =>
     api.get(`/api/movement/${symbol}`).then((r) => r.data).catch(() => ({ movement_significant: false })),
+  indexBreadth: (symbol) =>
+    api.get(`/api/scanners/index-breadth/${encodeURIComponent(symbol)}`).then((r) => r.data).catch(() => ({ available: false, breadth_score: 0, reason: "Unavailable" })),
   /** Multi-timeframe trading signal (backend-generated). */
   tradingSignal: (symbol) =>
     api.get(`/api/trading-signal/${symbol}`).then((r) => r.data),
@@ -110,6 +135,10 @@ export const analyticsApi = {
   /** Commodities: AI insights (lightweight cached). */
   commodityInsights: (symbol) =>
     api.get(`/api/commodity/insights/${encodeURIComponent(symbol)}`).then((r) => r.data),
+  sandboxScenarios: () =>
+    api.get("/api/sandbox/scenarios").then((r) => r.data),
+  runSandbox: ({ symbol = "NIFTY", scenario = "trend_up_news", steps = 120, seed = 7 } = {}) =>
+    api.get("/api/sandbox/run", { params: { symbol, scenario, steps, seed } }).then((r) => r.data),
 };
 
 export const adminApi = {
@@ -118,6 +147,16 @@ export const adminApi = {
   systemHealth: () => api.get("/admin/system-health").then((r) => r.data),
   signalAnalytics: (days = 7, limit = 200) =>
     api.get("/admin/signal-analytics", { params: { days, limit } }).then((r) => r.data),
+  broadcastDesk: () => api.get("/admin/broadcast-desk").then((r) => r.data),
+};
+
+export const publishingApi = {
+  workspace: (channel = "whatsapp") =>
+    api.get("/publishing/workspace", { params: { channel } }).then((r) => r.data),
+  refreshWorkspace: (channel = "whatsapp") =>
+    api.post("/publishing/workspace/refresh", null, { params: { channel } }).then((r) => r.data),
+  updateDraftStatus: (draftId, status) =>
+    api.post(`/publishing/drafts/${draftId}/status`, { status }).then((r) => r.data?.draft),
 };
 
 export default api;

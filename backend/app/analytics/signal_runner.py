@@ -40,7 +40,15 @@ from app.analytics.signal_outcomes import (
     refresh_pending_signal_outcomes,
 )
 from app.analytics.signal_engine import Bias, Signal, TradingSignal
-from app.analytics.trade_manager import apply_managed_trade_decision, get_open_trade_row, trade_state_from_row
+from app.analytics.signal_text import fit_trading_signal_reason
+from app.analytics.trade_manager import (
+    apply_managed_trade_decision,
+    get_open_trade_row,
+    stop_threshold_points,
+    success_threshold_points,
+    trade_state_from_row,
+)
+from app.analytics.volatility_profile import scale_trade_thresholds
 from app.config import settings
 from app.db.database import AsyncSessionLocal
 from app.logging_config import get_logger
@@ -462,7 +470,10 @@ async def run_signal_engine_cycle() -> None:
 
                 managed_hard_exit = False
                 managed_hard_exit_reason = None
+                managed_entry_gate_reason = None
                 managed_base_signal = ts.signal.value
+                managed_success_threshold = None
+                managed_stop_points = None
                 open_main_trade_row = await get_open_trade_row(session, engine="MAIN", symbol=symbol)
                 open_main_trade = trade_state_from_row(open_main_trade_row)
                 if f5_views and f30_views and f60_views:
@@ -500,6 +511,55 @@ async def run_signal_engine_cycle() -> None:
                         if management_plan.hard_exit:
                             managed_hard_exit = True
                             managed_hard_exit_reason = management_plan.hard_exit_reason
+                if long_context is not None:
+                    managed_success_threshold, managed_stop_points = scale_trade_thresholds(
+                        base_success=success_threshold_points("MAIN", symbol),
+                        base_stop=stop_threshold_points("MAIN", symbol),
+                        volatility_ratio=long_context.intraday_volatility_ratio,
+                        event_risk=long_context.event_profile in {"event", "event_expiry", "expiry"},
+                    )
+                    if open_main_trade is None and managed_base_signal in {"Buy CE", "Buy PE"}:
+                        if long_context.session_bucket == "MIDDAY" and int(ts.confidence) < 88:
+                            managed_entry_gate_reason = (
+                                "Entry blocked: midday structure is still noisy for fresh long entries."
+                            )
+                        elif (
+                            long_context.intraday_volatility_ratio is not None
+                            and long_context.intraday_volatility_ratio < 0.82
+                            and int(ts.confidence) < 90
+                        ):
+                            managed_entry_gate_reason = (
+                                "Entry blocked: intraday volatility is too compressed for a clean long setup."
+                            )
+                        elif (
+                            long_context.intraday_volatility_ratio is not None
+                            and long_context.intraday_volatility_ratio > 1.8
+                            and int(ts.confidence) < 90
+                        ):
+                            managed_entry_gate_reason = (
+                                "Entry blocked: tape is hyper-volatile; waiting for cleaner continuation."
+                            )
+                        elif long_context.breadth_available:
+                            if (
+                                managed_base_signal == "Buy CE"
+                                and not (
+                                    long_context.breadth_direction == "bullish"
+                                    and int(long_context.breadth_score or 0) >= 18
+                                )
+                            ):
+                                managed_entry_gate_reason = (
+                                    "Entry blocked: internal breadth is not confirming the bullish setup."
+                                )
+                            elif (
+                                managed_base_signal == "Buy PE"
+                                and not (
+                                    long_context.breadth_direction == "bearish"
+                                    and int(long_context.breadth_score or 0) <= -18
+                                )
+                            ):
+                                managed_entry_gate_reason = (
+                                    "Entry blocked: internal breadth is not confirming the bearish setup."
+                                )
 
                 managed_decision, _managed_trade_row = await apply_managed_trade_decision(
                     session,
@@ -512,13 +572,21 @@ async def run_signal_engine_cycle() -> None:
                     now_utc=generated_at,
                     hard_exit=managed_hard_exit,
                     hard_exit_reason=managed_hard_exit_reason,
+                    success_threshold_override=managed_success_threshold,
+                    stop_points_override=managed_stop_points,
+                    signal_version="main_v4_live",
+                    entry_gate_reason=managed_entry_gate_reason,
                 )
                 public_signal = managed_decision.public_signal
                 public_reason = (
                     managed_decision.management_reason
-                    if managed_decision.action in {"hold", "exit"}
+                    if (
+                        managed_decision.action in {"hold", "exit"}
+                        or (managed_decision.action == "wait" and managed_base_signal in {"Buy CE", "Buy PE"})
+                    )
                     else ts.reason
                 )
+                stored_reason = fit_trading_signal_reason(public_reason)
 
                 row = TradingSignalRow(
                     symbol=symbol,
@@ -529,7 +597,7 @@ async def run_signal_engine_cycle() -> None:
                     bias_5m=ts.bias_5m.value,
                     bias_30m=ts.bias_30m.value,
                     bias_60m=ts.bias_60m.value,
-                    reason=public_reason,
+                    reason=stored_reason,
                 )
                 session.add(row)
 
@@ -607,7 +675,7 @@ async def run_signal_engine_cycle() -> None:
                 await record_shadow_decision(
                     session,
                     engine="MAIN",
-                    signal_version="main_v2_live",
+                    signal_version="main_v4_live",
                     mode="LIVE",
                     symbol=symbol,
                     signal=public_signal,
@@ -629,7 +697,7 @@ async def run_signal_engine_cycle() -> None:
                 await record_shadow_decision(
                     session,
                     engine="MAIN",
-                    signal_version="main_v3_shadow",
+                    signal_version="main_v4_shadow",
                     mode="SHADOW",
                     symbol=symbol,
                     signal=shadow_signal,
@@ -662,7 +730,7 @@ async def run_signal_engine_cycle() -> None:
                         await record_quant_signal_candidate(
                             session,
                             engine="MAIN",
-                            signal_version="main_v2_live",
+                            signal_version="main_v4_live",
                             symbol=symbol,
                             signal=public_signal,
                             confidence=int(ts.confidence),
@@ -679,7 +747,7 @@ async def run_signal_engine_cycle() -> None:
                     await record_quant_signal_candidate(
                         session,
                         engine="MAIN",
-                        signal_version="main_v3_shadow",
+                        signal_version="main_v4_shadow",
                         symbol=symbol,
                         signal=shadow_signal,
                         confidence=shadow_confidence,
